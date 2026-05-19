@@ -64,7 +64,7 @@ func Example_producer() {
 	client.Send(producer.Record{
 		Collection: "logs",
 		Ops:        "access",
-		Pid:        "service_a",
+		PSid:        "service_a",
 		ProducerID: 1,
 		Data:       "POST /api/verify status=200",
 		CreatedAt:  time.Now().UnixMilli(),
@@ -73,7 +73,7 @@ func Example_producer() {
 	// 无效记录：Collection 为空 → 丢弃 + 日志
 	client.Send(producer.Record{
 		Ops:  "access",
-		Pid:  "service_a",
+		PSid:  "service_a",
 		Data: "missing collection",
 	})
 
@@ -91,7 +91,7 @@ func Example_directWrite() {
 	)
 
 	bulkwriter.BulkInsert(context.Background(), db, []model.Record{
-		{Collection: "api_logs", Ops: "verify", Pid: "126", Data: "...", CreatedAt: time.Now().UnixMilli()},
-		{Collection: "api_logs", Ops: "report", Pid: "126", Data: "...", CreatedAt: time.Now().UnixMilli()},
+		{Collection: "api_logs", Ops: "verify", PSid: "126", Data: "...", CreatedAt: time.Now().UnixMilli()},
+		{Collection: "api_logs", Ops: "report", PSid: "126", Data: "...", CreatedAt: time.Now().UnixMilli()},
 	})
 }

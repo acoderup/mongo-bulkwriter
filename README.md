@@ -44,7 +44,7 @@ r.POST("/bulkwriter/ingest", gin.WrapH(handler))
 
 // 4. 本服务内直接写入
 bulkwriter.BulkInsert(ctx, db, []model.Record{{
-    Collection: "logs", Ops: "test", Pid: "1",
+    Collection: "logs", Ops: "test", PSid: "1",
     Data: "...", CreatedAt: time.Now().UnixMilli(),
 }})
 ```
@@ -67,7 +67,7 @@ defer client.Close()
 client.Send(producer.Record{
     Collection: "logs",
     Ops:        "access",
-    Pid:        "service_a",
+    PSid:        "service_a",
     ProducerID: 1,
     Data:       "...",
     CreatedAt:  time.Now().UnixMilli(),
@@ -80,7 +80,7 @@ client.Send(producer.Record{
 result, _ := bulkwriter.Query(ctx, db, bulkwriter.QueryParams{
     Collection: "logs",
     Ops:        "access",
-    Pid:        "service_a",
+    PSid:        "service_a",
     ProducerID: 1,
     Limit:      100,
 })
@@ -134,7 +134,7 @@ client := producer.New(producer.Config{AuthToken: "my-secret"})
 | 索引 | 查询场景 |
 |------|---------|
 | `ops` | 按操作类型 |
-| `pid` | 按项目标识 |
+| `psid` | 按项目标识 |
 | `producer_id` | 按生产者 |
 | `{ops, pid}` | 操作 + 项目 |
 | `{ops, producer_id}` | 操作 + 生产者 |
@@ -148,7 +148,7 @@ client := producer.New(producer.Config{AuthToken: "my-secret"})
 type Record struct {
     Collection string `json:"collection"`  // 目标集合（必填）
     Ops        string `json:"ops"`         // 操作标识（必填）
-    Pid        string `json:"pid"`         // 项目标识（必填）
+    Pid        string `json:"psid"`         // 项目标识（必填）
     ProducerID int    `json:"producer_id"` // 生产者编号
     Data       string `json:"data"`        // 业务数据（字符串）
     CreatedAt  int64  `json:"created_at"`  // Unix 毫秒时间戳

@@ -95,11 +95,11 @@ func New(cfg Config) *Client {
 }
 
 // Send 非阻塞写入一条记录。队列满时丢弃并返回 false。
-// Collection、Ops、Pid 为空时丢弃并打印错误日志。
+// Collection、Ops、PSid 为空时丢弃并打印错误日志。
 func (c *Client) Send(record Record) bool {
-	if record.Collection == "" || record.Ops == "" || record.Pid == "" {
-		log.Printf("[producer] invalid record dropped: collection=%q ops=%q pid=%q",
-			record.Collection, record.Ops, record.Pid)
+	if record.Collection == "" || record.Ops == "" || record.PSid == "" {
+		log.Printf("[producer] invalid record dropped: collection=%q ops=%q psid=%q",
+			record.Collection, record.Ops, record.PSid)
 		return false
 	}
 	select {

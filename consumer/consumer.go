@@ -167,7 +167,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	// 非阻塞入队（空字段丢弃）
 	var queued int
 	for _, record := range req.Records {
-		if record.Collection == "" || record.Ops == "" || record.Pid == "" {
+		if record.Collection == "" || record.Ops == "" || record.PSid == "" {
 			h.metrics.mu.Lock()
 			h.metrics.Dropped++
 			h.metrics.mu.Unlock()

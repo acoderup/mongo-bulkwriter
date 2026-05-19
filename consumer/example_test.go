@@ -42,7 +42,7 @@ func Example_bulkInsert() {
 		"mongodb://127.0.0.1:27017", "qstar-history")
 
 	bulkwriter.BulkInsert(context.Background(), db, []model.Record{
-		{Collection: "logs", Ops: "test", Pid: "1", Data: "hello", CreatedAt: time.Now().UnixMilli()},
-		{Collection: "logs", Ops: "test", Pid: "1", Data: "world", CreatedAt: time.Now().UnixMilli()},
+		{Collection: "logs", Ops: "test", PSid: "1", Data: "hello", CreatedAt: time.Now().UnixMilli()},
+		{Collection: "logs", Ops: "test", PSid: "1", Data: "world", CreatedAt: time.Now().UnixMilli()},
 	})
 }
