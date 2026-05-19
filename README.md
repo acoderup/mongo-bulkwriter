@@ -18,8 +18,8 @@ go get github.com/acoderup/mongo-bulkwriter
 
 ```go
 import (
-    "github.com/USERNAME/mongo-bulkwriter"
-    "github.com/USERNAME/mongo-bulkwriter/consumer"
+    "github.com/acoderup/mongo-bulkwriter"
+    "github.com/acoderup/mongo-bulkwriter/consumer"
 )
 
 // 1. 连接 MongoDB
@@ -52,7 +52,7 @@ bulkwriter.BulkInsert(ctx, db, []model.Record{{
 ### 生产者端
 
 ```go
-import "github.com/USERNAME/mongo-bulkwriter/producer"
+import "github.com/acoderup/mongo-bulkwriter/producer"
 
 client := producer.New(producer.Config{
     ConsumerURL:   "http://127.0.0.1:803/bulkwriter/ingest",

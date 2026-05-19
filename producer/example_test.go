@@ -9,7 +9,7 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/USERNAME/mongo-bulkwriter/producer"
+	"github.com/acoderup/mongo-bulkwriter/producer"
 )
 
 const authToken = "my-secret-token"
@@ -57,9 +57,9 @@ func Example() {
 
 	// 无效记录：Collection 为空 → 丢弃 + 错误日志
 	client.Send(producer.Record{
-		Ops:   "test",
-		Pid:   "x",
-		Data:  "missing collection",
+		Ops:  "test",
+		Pid:  "x",
+		Data: "missing collection",
 	})
 
 	// 无效记录：Ops 为空 → 丢弃 + 错误日志

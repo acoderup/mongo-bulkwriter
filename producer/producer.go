@@ -23,7 +23,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/USERNAME/mongo-bulkwriter/model"
+	"github.com/acoderup/mongo-bulkwriter/model"
 )
 
 // Record 是生产者发送的单条记录（model.Record 的别名，方便导入）。
@@ -56,9 +56,9 @@ type Client struct {
 	cfg       Config
 	authToken string
 	queue     chan Record
-	client *http.Client
-	wg     sync.WaitGroup
-	cancel context.CancelFunc
+	client    *http.Client
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
 }
 
 // New 创建生产者客户端并启动后台发送 goroutine。

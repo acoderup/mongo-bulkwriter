@@ -22,8 +22,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/USERNAME/mongo-bulkwriter"
-	"github.com/USERNAME/mongo-bulkwriter/model"
+	"github.com/acoderup/mongo-bulkwriter"
+	"github.com/acoderup/mongo-bulkwriter/model"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -62,22 +62,22 @@ func DefaultConfig() Config {
 type Handler struct {
 	db        *mongo.Database
 	authToken string
-	queue   chan model.Record
-	sem     chan struct{} // 并发控制信号量
-	cfg     Config
-	wg      sync.WaitGroup
-	cancel  context.CancelFunc
-	metrics Metrics
+	queue     chan model.Record
+	sem       chan struct{} // 并发控制信号量
+	cfg       Config
+	wg        sync.WaitGroup
+	cancel    context.CancelFunc
+	metrics   Metrics
 }
 
 // Metrics 消费者运行指标。
 type Metrics struct {
-	mu            sync.RWMutex
-	Received      int64 // 接收记录总数
-	Dropped       int64 // 因队列满丢弃数
-	Written       int64 // 成功写入数
-	WriteErrors   int64 // 写入失败数
-	QueueLen      int   // 当前队列长度
+	mu          sync.RWMutex
+	Received    int64 // 接收记录总数
+	Dropped     int64 // 因队列满丢弃数
+	Written     int64 // 成功写入数
+	WriteErrors int64 // 写入失败数
+	QueueLen    int   // 当前队列长度
 }
 
 // NewHandler 创建消费者处理器并启动后台 worker 池。
@@ -109,10 +109,10 @@ func NewHandler(db *mongo.Database, cfg Config) *Handler {
 	h := &Handler{
 		db:        db,
 		authToken: cfg.AuthToken,
-		queue:  make(chan model.Record, cfg.QueueSize),
-		sem:    make(chan struct{}, cfg.MaxConcurrent),
-		cfg:    cfg,
-		cancel: cancel,
+		queue:     make(chan model.Record, cfg.QueueSize),
+		sem:       make(chan struct{}, cfg.MaxConcurrent),
+		cfg:       cfg,
+		cancel:    cancel,
 	}
 
 	// 启动 worker 池

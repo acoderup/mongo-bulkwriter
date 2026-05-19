@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/USERNAME/mongo-bulkwriter"
-	"github.com/USERNAME/mongo-bulkwriter/consumer"
-	"github.com/USERNAME/mongo-bulkwriter/model"
-	"github.com/USERNAME/mongo-bulkwriter/producer"
+	"github.com/acoderup/mongo-bulkwriter"
+	"github.com/acoderup/mongo-bulkwriter/consumer"
+	"github.com/acoderup/mongo-bulkwriter/model"
+	"github.com/acoderup/mongo-bulkwriter/producer"
 )
 
 const authToken = "my-secret-token"
@@ -72,9 +72,9 @@ func Example_producer() {
 
 	// 无效记录：Collection 为空 → 丢弃 + 日志
 	client.Send(producer.Record{
-		Ops:   "access",
-		Pid:   "service_a",
-		Data:  "missing collection",
+		Ops:  "access",
+		Pid:  "service_a",
+		Data: "missing collection",
 	})
 
 	log.Println("生产者已发送数据")

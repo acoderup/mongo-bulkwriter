@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/USERNAME/mongo-bulkwriter"
-	"github.com/USERNAME/mongo-bulkwriter/consumer"
-	"github.com/USERNAME/mongo-bulkwriter/model"
+	"github.com/acoderup/mongo-bulkwriter"
+	"github.com/acoderup/mongo-bulkwriter/consumer"
+	"github.com/acoderup/mongo-bulkwriter/model"
 )
 
 const authToken = "my-secret-token"
