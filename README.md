@@ -9,7 +9,7 @@ Producer (其他服务) ──HTTP POST──→ Consumer (本项目) ──Bulk
 ## 安装
 
 ```bash
-go get github.com/USERNAME/mongo-bulkwriter
+go get github.com/acoderup/mongo-bulkwriter
 ```
 
 ## 快速开始

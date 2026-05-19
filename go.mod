@@ -1,4 +1,4 @@
-module github.com/USERNAME/mongo-bulkwriter
+module github.com/acoderup/mongo-bulkwriter
 
 go 1.26.2
 
