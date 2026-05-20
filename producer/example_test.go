@@ -31,7 +31,7 @@ func Example() {
 		Ops:        "access",
 		PSid:        "service_a",
 		ProducerID: 1,
-		Data:       "POST /api/verify ip=192.168.1.1 status=200",
+		Gd:       "POST /api/verify ip=192.168.1.1 status=200",
 		CreatedAt:  time.Now().UnixMilli(),
 	})
 
@@ -41,7 +41,7 @@ func Example() {
 		Ops:        "login",
 		PSid:        "user_123",
 		ProducerID: 1,
-		Data:       `{"event":"user_login","uid":"user_123"}`,
+		Gd:       `{"event":"user_login","uid":"user_123"}`,
 		CreatedAt:  time.Now().UnixMilli(),
 	})
 
@@ -51,7 +51,7 @@ func Example() {
 		Ops:        "metric",
 		PSid:        "monitor",
 		ProducerID: 2,
-		Data:       "cpu=45.2 mem=72.1",
+		Gd:       "cpu=45.2 mem=72.1",
 		CreatedAt:  time.Now().UnixMilli(),
 	})
 
@@ -59,14 +59,14 @@ func Example() {
 	client.Send(producer.Record{
 		Ops:  "test",
 		PSid:  "x",
-		Data: "missing collection",
+		Gd: "missing collection",
 	})
 
 	// 无效记录：Ops 为空 → 丢弃 + 错误日志
 	client.Send(producer.Record{
 		Collection: "test",
 		PSid:        "x",
-		Data:       "missing ops",
+		Gd:       "missing ops",
 	})
 
 	sig := make(chan os.Signal, 1)

@@ -12,10 +12,15 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
 
-// indexedCollections 记录当前进程已确认存在索引的集合（避免重复查询 Mongo）。
+// indexedCollections 记录当前进程已确认存在索引的集合（进程内缓存，避免重复查询 Mongo）。
 var indexedCollections sync.Map
 
 // ConnectMongo 创建高吞吐优化的 MongoDB 连接。
+//
+// 连接配置：
+//   - 最大连接池 300，最小 50（支持高并发写入）
+//   - WriteConcern: Unacknowledged（不等待确认，追求极致吞吐）
+//   - 禁用重试写入（避免乱序）
 func ConnectMongo(ctx context.Context, uri, dbName string) (*mongo.Client, *mongo.Database, error) {
 	opts := options.Client().
 		ApplyURI(uri).
@@ -36,7 +41,10 @@ func ConnectMongo(ctx context.Context, uri, dbName string) (*mongo.Client, *mong
 	return client, client.Database(dbName), nil
 }
 
-// EnsureIndexes 为指定集合显式创建查询索引。幂等操作。
+// EnsureIndexes 为指定集合显式创建查询索引。幂等操作，可重复调用。
+//
+// 首次调用时创建索引，进程内缓存已创建的集合名，后续调用自动跳过。
+// 索引列表见 ensureIndexesFor 函数。
 func EnsureIndexes(ctx context.Context, db *mongo.Database, collections ...string) error {
 	for _, collName := range collections {
 		if err := ensureIndexesFor(ctx, db, collName); err != nil {
@@ -46,7 +54,20 @@ func EnsureIndexes(ctx context.Context, db *mongo.Database, collections ...strin
 	return nil
 }
 
-// ensureIndexesFor 为单个集合创建索引，自动跳过已存在的索引。
+// ensureIndexesFor 为单个集合创建查询索引，自动跳过已存在的索引。
+//
+// 创建的单字段索引：
+//   - ops: 按操作类型查询
+//   - psid: 按项目/会话标识查询
+//   - producer_id: 按生产者编号查询
+//   - tid: 按记录ID查询
+//   - created_at: 时间倒序排序
+//
+// 创建的复合索引：
+//   - {ops, psid}
+//   - {ops, producer_id}
+//   - {psid, producer_id}
+//   - {ops, psid, producer_id}
 func ensureIndexesFor(ctx context.Context, db *mongo.Database, collName string) error {
 	if _, ok := indexedCollections.Load(collName); ok {
 		return nil
@@ -81,6 +102,7 @@ func ensureIndexesFor(ctx context.Context, db *mongo.Database, collName string) 
 		{Keys: bson.D{{Key: "psid", Value: 1}, {Key: "producer_id", Value: 1}}},
 		{Keys: bson.D{{Key: "ops", Value: 1}, {Key: "psid", Value: 1}, {Key: "producer_id", Value: 1}}},
 		{Keys: bson.D{{Key: "created_at", Value: -1}}},
+		{Keys: bson.D{{Key: "tid", Value: 1}}},
 	}
 
 	var toCreate []mongo.IndexModel
@@ -100,6 +122,14 @@ func ensureIndexesFor(ctx context.Context, db *mongo.Database, collName string) 
 }
 
 // BulkInsert 按 Record.Collection 分组后 unordered BulkWrite 写入 MongoDB。
+//
+// 特性：
+//   - 自动按 Collection 分组写入不同集合
+//   - 使用 unordered BulkWrite（单条失败不影响其他）
+//   - 首次写入集合时自动创建索引
+//   - Collection 为空时默认写入 "default" 集合
+//
+// 返回值：成功写入的记录数、错误。
 func BulkInsert(ctx context.Context, db *mongo.Database, records []model.Record) (int, error) {
 	groups := make(map[string][]mongo.WriteModel)
 
@@ -108,12 +138,15 @@ func BulkInsert(ctx context.Context, db *mongo.Database, records []model.Record)
 		if collName == "" {
 			collName = "default"
 		}
-		doc := map[string]interface{}{
-			"ops":         r.Ops,
-			"psid":        r.PSid,
-			"producer_id": r.ProducerID,
-			"data":        r.Data,
-			"created_at":  r.CreatedAt,
+		doc := model.DocRecord{
+			Ops:        r.Ops,
+			PSid:       r.PSid,
+			ProducerID: r.ProducerID,
+			Tba:        r.Tba,
+			Tid:        r.Tid,
+			Twla:       r.Twla,
+			Gd:         r.Gd,
+			CreatedAt:  r.CreatedAt,
 		}
 		groups[collName] = append(groups[collName], mongo.NewInsertOneModel().SetDocument(doc))
 	}
@@ -135,22 +168,40 @@ func BulkInsert(ctx context.Context, db *mongo.Database, records []model.Record)
 }
 
 // QueryParams 查询参数。
+//
+// 所有筛选条件均为可选，未设置的条件不参与筛选。
+// 支持时间范围、分页、多条件联合查询。
 type QueryParams struct {
-	Collection string // 要查询的集合
-	Ops        string // 按 ops 筛选（可选）
-	PSid       string // 按 psid 筛选（可选）
-	ProducerID int    // 按 producer_id 筛选（可选，0 表示不筛选）
-	Limit      int64  // 返回条数限制，默认 100
-	Skip       int64  // 跳过条数，用于分页
+	Collection    string // 要查询的集合（必填，为空默认 "default"）
+	Ops           string // 按 ops 筛选（可选）
+	PSid          string // 按 psid 筛选（可选）
+	ProducerID    int    // 按 producer_id 筛选（可选，0 表示不筛选）
+	Tid           string // 按 tid 筛选（可选）
+	CreatedAfter  int64  // 按 created_at >= 筛选（Unix 毫秒时间戳，可选，0 表示不筛选）
+	CreatedBefore int64  // 按 created_at <= 筛选（Unix 毫秒时间戳，可选，0 表示不筛选）
+	Limit         int64  // 返回条数限制，默认 100
+	Skip          int64  // 跳过条数，用于分页
 }
 
 // QueryResult 查询结果。
+//
+// Records 为类型化的 DocRecord 切片，Total 为符合筛选条件的总记录数（不受 Skip/Limit 影响）。
 type QueryResult struct {
-	Records []map[string]interface{} `json:"records"`
-	Total   int64                    `json:"total"`
+	Records []model.DocRecord `json:"records"` // 查询结果记录列表
+	Total   int64             `json:"total"`   // 符合条件的总记录数
 }
 
-// Query 根据 ops、psid、producer_id 查询记录。按 created_at 倒序。
+// Query 根据指定条件查询记录，按 created_at 倒序排列。
+//
+// 支持的筛选条件：
+//   - ops: 操作类型精确匹配
+//   - psid: 项目/会话标识精确匹配
+//   - producer_id: 生产者编号精确匹配
+//   - tid: 记录ID精确匹配
+//   - created_at 时间范围（CreatedAfter <= created_at <= CreatedBefore）
+//
+// 分页：Limit 默认 100，Skip 用于跳过分页。
+// Total 返回符合条件的总数，不受 Limit/Skip 影响。
 func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryResult, error) {
 	if params.Limit <= 0 {
 		params.Limit = 100
@@ -168,6 +219,19 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 	}
 	if params.ProducerID != 0 {
 		filter["producer_id"] = params.ProducerID
+	}
+	if params.Tid != "" {
+		filter["tid"] = params.Tid
+	}
+	if params.CreatedAfter != 0 || params.CreatedBefore != 0 {
+		createdFilter := bson.M{}
+		if params.CreatedAfter != 0 {
+			createdFilter["$gte"] = params.CreatedAfter
+		}
+		if params.CreatedBefore != 0 {
+			createdFilter["$lte"] = params.CreatedBefore
+		}
+		filter["created_at"] = createdFilter
 	}
 
 	coll := db.Collection(params.Collection)
@@ -188,7 +252,7 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 	}
 	defer cursor.Close(ctx)
 
-	var records []map[string]interface{}
+	var records []model.DocRecord
 	if err := cursor.All(ctx, &records); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}

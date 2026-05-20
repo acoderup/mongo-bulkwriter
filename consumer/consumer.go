@@ -1,16 +1,22 @@
-// Package consumer 提供高并发消费者 HTTP 服务端，接收生产者批量数据并写入 MongoDB。
+// Package consumer 提供高并发消费者 HTTP 服务端，接收生产者批量数据并异步写入 MongoDB。
 //
 // 内部架构：
 //
-//	HTTP ingest → internal queue (non-blocking) → worker pool → batch → Mongo BulkWrite
+//	HTTP ingest → 鉴权 → 空字段校验 → 非阻塞入队 → 内部队列 → worker pool → batch → Mongo BulkWrite
 //
-// HTTP 处理器非阻塞接收，立即返回 202。后台 worker 异步批量写入 Mongo。
-// 内置并发控制（信号量限制同时写入数）和背压保护（队列满返回 429）。
+// 特性：
+//   - 非阻塞接收：HTTP 请求立即返回 202，不等待 Mongo 写入
+//   - Worker 池：多个 goroutine 并行聚合 batch 并写入
+//   - 并发控制：信号量限制同时进行的 BulkWrite 数量
+//   - 背压保护：队列满时丢弃记录并返回 429
+//   - 鉴权：X-Auth-Token 恒定时间比较，防时序攻击
+//   - 自动索引：首次写入集合时自动创建查询索引
 //
 // 用法：
 //
-//	h := consumer.NewHandler(db, consumer.DefaultConfig())
+//	h := consumer.NewHandler(db, consumer.Config{AuthToken: "secret"})
 //	r.POST("/bulkwriter/ingest", gin.WrapH(h))
+//	defer h.Shutdown()
 package consumer
 
 import (
@@ -28,18 +34,22 @@ import (
 )
 
 // Config 消费者配置。
+//
+// 所有数值字段为 0 时使用默认值。AuthToken 为空则不校验鉴权。
 type Config struct {
-	AuthToken     string        // 鉴权令牌，生产者需要携带相同令牌才能连接（空则不校验）
+	AuthToken     string        // 鉴权令牌，生产者需携带相同令牌（空则不校验）
 	Workers       int           // worker goroutine 数量，默认 32
-	BatchSize     int           // 批量写入大小，默认 500
+	BatchSize     int           // 批量写入大小（条数），默认 500
 	BatchBytes    int           // 批量最大字节数（估算），默认 8MB
 	FlushInterval time.Duration // flush 超时间隔，默认 100ms
 	QueueSize     int           // 内部缓冲队列大小，默认 50000
 	MaxConcurrent int           // 最大并发 Mongo BulkWrite 数，默认 16
-	MaxBodySize   int64         // 请求体最大字节数，默认 10MB
+	MaxBodySize   int64         // 请求体最大字节数（硬限制），默认 10MB
 }
 
 // DefaultConfig 返回推荐配置。
+//
+// 适用于中高负载场景：32 workers、500 条/批、100ms flush、50000 队列、16 并发写。
 func DefaultConfig() Config {
 	return Config{
 		Workers:       32,
@@ -54,16 +64,18 @@ func DefaultConfig() Config {
 
 // Handler 是高并发消费者的 HTTP 处理器。
 //
-// 启动时内部创建 worker 池，异步从内部队列消费并写入 Mongo。
-// HTTP 请求直接入队，不阻塞等待 Mongo 写入。
+// 内部维护：
+//   - 有缓冲 channel 作为内部队列
+//   - worker goroutine 池，从队列消费并批量写入
+//   - 信号量控制最大并发 BulkWrite 数
+//   - 运行时指标（接收/丢弃/写入/错误计数）
 //
-// 鉴权：如果配置了 AuthToken，生产者必须在请求头携带 X-Auth-Token: <token>。
-// 使用 constant-time 比较防止时序攻击。
+// 启动时自动创建 worker 池，Shutdown 时等待队列清空后退出。
 type Handler struct {
-	db        *mongo.Database
-	authToken string
-	queue     chan model.Record
-	sem       chan struct{} // 并发控制信号量
+	db        *mongo.Database // MongoDB 数据库句柄
+	authToken string          // 鉴权令牌
+	queue     chan model.Record // 内部缓冲队列
+	sem       chan struct{}   // 并发控制信号量
 	cfg       Config
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
@@ -74,13 +86,16 @@ type Handler struct {
 type Metrics struct {
 	mu          sync.RWMutex
 	Received    int64 // 接收记录总数
-	Dropped     int64 // 因队列满丢弃数
-	Written     int64 // 成功写入数
+	Dropped     int64 // 因队列满或空字段丢弃数
+	Written     int64 // 成功写入 Mongo 数
 	WriteErrors int64 // 写入失败数
 	QueueLen    int   // 当前队列长度
 }
 
 // NewHandler 创建消费者处理器并启动后台 worker 池。
+//
+// 自动填充默认配置（零值字段），创建内部队列和信号量，
+// 启动指定数量的 worker goroutine。
 func NewHandler(db *mongo.Database, cfg Config) *Handler {
 	if cfg.Workers == 0 {
 		cfg.Workers = 32
@@ -126,23 +141,31 @@ func NewHandler(db *mongo.Database, cfg Config) *Handler {
 	return h
 }
 
-// ServeHTTP 实现 http.Handler 接口。
+// ServeHTTP 实现 http.Handler 接口，直接委托给 Ingest。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.Ingest(w, r)
 }
 
 // Ingest 接收批量记录，入队后立即返回。非阻塞。
 //
+// 处理流程：
+//  1. 校验 HTTP 方法（仅 POST）
+//  2. 鉴权校验（X-Auth-Token，恒定时间比较）
+//  3. 限制请求体大小（MaxBodySize）
+//  4. JSON 解码
+//  5. 逐条入队（Collection/Ops/PSid 为空则丢弃）
+//  6. 返回 202（部分成功）或 429（全部丢弃）
+//
 //	POST /bulkwriter/ingest
-//	Body: {"records": [...]}  (max 10MB)
-//	Response: {"written": 0, "queued": N}  或 429 过载
+//	Body: {"records": [...]}  (max 默认 10MB)
+//	Response: {"written": 0, "queued": N}
 func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeJSON(w, http.StatusMethodNotAllowed, model.IngestResponse{Error: "method not allowed"})
 		return
 	}
 
-	// 鉴权校验
+	// 鉴权校验：恒定时间比较防时序攻击
 	if h.authToken != "" {
 		if subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Auth-Token")), []byte(h.authToken)) != 1 {
 			writeJSON(w, http.StatusForbidden, model.IngestResponse{Error: "forbidden"})
@@ -150,7 +173,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 限制请求体大小
+	// 限制请求体大小，防止内存溢出
 	r.Body = http.MaxBytesReader(w, r.Body, h.cfg.MaxBodySize)
 
 	var req model.IngestRequest
@@ -164,9 +187,10 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 非阻塞入队（空字段丢弃）
+	// 非阻塞入队
 	var queued int
 	for _, record := range req.Records {
+		// 必填字段校验
 		if record.Collection == "" || record.Ops == "" || record.PSid == "" {
 			h.metrics.mu.Lock()
 			h.metrics.Dropped++
@@ -177,6 +201,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		case h.queue <- record:
 			queued++
 		default:
+			// 队列满，丢弃
 			h.metrics.mu.Lock()
 			h.metrics.Dropped++
 			h.metrics.mu.Unlock()
@@ -187,7 +212,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	h.metrics.Received += int64(queued)
 	h.metrics.mu.Unlock()
 
-	// 过载保护：丢弃率过高时返回 429
+	// 过载保护：全部丢弃时返回 429
 	if queued == 0 && len(req.Records) > 0 {
 		writeJSON(w, http.StatusTooManyRequests, model.IngestResponse{
 			Error: "queue full, all records dropped",
@@ -201,7 +226,12 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Shutdown 优雅关闭：停止接收 → 等待队列清空 → 关闭 worker。
+// Shutdown 优雅关闭消费者。
+//
+// 步骤：
+//  1. 取消 context，通知所有 worker 停止接收
+//  2. 等待 worker 将队列中剩余数据全部写入 Mongo
+//  3. 打印最终指标
 func (h *Handler) Shutdown() {
 	h.cancel()
 	h.wg.Wait()
@@ -209,7 +239,7 @@ func (h *Handler) Shutdown() {
 		h.metrics.Received, h.metrics.Dropped, h.metrics.Written, h.metrics.WriteErrors)
 }
 
-// MetricsSnapshot 返回当前指标快照。
+// MetricsSnapshot 返回当前指标快照（线程安全）。
 func (h *Handler) MetricsSnapshot() Metrics {
 	h.metrics.mu.RLock()
 	defer h.metrics.mu.RUnlock()
@@ -222,7 +252,15 @@ func (h *Handler) MetricsSnapshot() Metrics {
 	}
 }
 
-// worker 单个 worker goroutine：聚合 batch → BulkWrite。
+// worker 单个 worker goroutine：从队列聚合 batch → BulkWrite。
+//
+// 发送触发条件（任一满足即 flush）：
+//  1. 达到 BatchSize 条
+//  2. 超过 BatchBytes 字节（估算）
+//  3. 超过 FlushInterval 时间
+//
+// flush 时复制 batch 避免与下一批共享底层数组，
+// 通过信号量控制并发 BulkWrite 数量。
 func (h *Handler) worker(ctx context.Context, id int) {
 	defer h.wg.Done()
 
@@ -260,17 +298,17 @@ func (h *Handler) worker(ctx context.Context, id int) {
 	for {
 		select {
 		case <-ctx.Done():
-			flush()
+			flush() // 关闭前刷出剩余数据
 			return
 		case <-ticker.C:
-			flush()
+			flush() // 定时刷新
 		case record, ok := <-h.queue:
 			if !ok {
 				flush()
 				return
 			}
 			batch = append(batch, record)
-			batchBytes += len(record.Data) + 200
+			batchBytes += len(record.Gd) + 200 // Gd 字符串长度 + 其他字段估算
 			if len(batch) >= h.cfg.BatchSize || batchBytes >= h.cfg.BatchBytes {
 				flush()
 			}
@@ -278,6 +316,7 @@ func (h *Handler) worker(ctx context.Context, id int) {
 	}
 }
 
+// writeJSON 写入 JSON 响应。
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
