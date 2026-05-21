@@ -312,3 +312,23 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 
 	return &QueryResult{Records: records, Total: total}, nil
 }
+
+// FindOne 精确查询单条记录，适用于按 tid 等唯一键查询的场景。
+//
+// 直接使用 collection.FindOne，无聚合、无分组、无分页，性能最高。
+// 未找到时返回 nil, nil（非错误）。
+func FindOne(ctx context.Context, db *mongo.Database, collection string, filter bson.M) (*model.DocRecord, error) {
+	if collection == "" {
+		collection = "default"
+	}
+
+	var doc model.DocRecord
+	err := db.Collection(collection).FindOne(ctx, filter).Decode(&doc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("findOne: %w", err)
+	}
+	return &doc, nil
+}
