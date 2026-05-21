@@ -185,19 +185,20 @@ type QueryParams struct {
 
 // QueryResult 查询结果。
 //
-// Records 为按 psid 去重后的 DocRecord 切片（相同 psid 仅保留最新一条），
+// Records 为当前页 psid 分组内的全部文档（可能超过 Limit 条），
 // Total 为去重后的 psid 总数（不受 Skip/Limit 影响）。
 type QueryResult struct {
-	Records []model.DocRecord `json:"records"` // 查询结果记录列表（按 psid 去重）
+	Records []model.DocRecord `json:"records"` // 当前页全部记录
 	Total   int64             `json:"total"`   // 去重后的 psid 总数
 }
 
-// Query 根据指定条件查询记录，按 created_at 倒序排列。
+// Query 根据指定条件查询记录，按 psid 分组分页。
 //
-// 结果按 psid 去重：相同 psid 的多条记录只保留 created_at 最新的一条，
-// 分页（Limit/Skip）和 Total 均以去重后的 psid 个数为准。
+// 分页以 psid 去重个数为准：相同 psid 的多条记录视为一组。
+// Total 为去重后的 psid 总数，Skip/Limit 按 psid 分组维度截取，
+// 但每组内的全部文档均会返回（返回条数可能超过 Limit）。
 //
-// 使用单次聚合查询（$facet）同时获取 total 和 paged records，避免二次往返。
+// 使用两次查询：聚合获取分页 psid 列表 + Find 获取对应全部文档。
 //
 // 支持的筛选条件：
 //   - ops: 操作类型精确匹配
@@ -206,7 +207,7 @@ type QueryResult struct {
 //   - tid: 记录ID精确匹配
 //   - created_at 时间范围（CreatedAfter <= created_at <= CreatedBefore）
 //
-// 分页：Limit 默认 100，Skip 用于跳过分页。
+// 分页：Limit 默认 100（分组数），Skip 用于跳过指定组数。
 // Total 返回符合条件的去重 psid 总数，不受 Limit/Skip 影响。
 func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryResult, error) {
 	if params.Limit <= 0 {
@@ -242,50 +243,71 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 
 	coll := db.Collection(params.Collection)
 
-	pipeline := mongo.Pipeline{
+	psidPipeline := mongo.Pipeline{
 		{{Key: "$match", Value: filter}},
-		{{Key: "$sort", Value: bson.D{{Key: "created_at", Value: -1}}}},
 		{{Key: "$group", Value: bson.D{
 			{Key: "_id", Value: "$psid"},
-			{Key: "doc", Value: bson.M{"$first": "$$ROOT"}},
+			{Key: "max_created", Value: bson.M{"$max": "$created_at"}},
 		}}},
-		{{Key: "$replaceRoot", Value: bson.M{"newRoot": "$doc"}}},
-		{{Key: "$sort", Value: bson.D{{Key: "created_at", Value: -1}}}},
+		{{Key: "$sort", Value: bson.D{{Key: "max_created", Value: -1}}}},
 		{{Key: "$facet", Value: bson.D{
 			{Key: "metadata", Value: mongo.Pipeline{
 				{{Key: "$count", Value: "total"}},
 			}},
-			{Key: "records", Value: mongo.Pipeline{
+			{Key: "paged", Value: mongo.Pipeline{
 				{{Key: "$skip", Value: params.Skip}},
 				{{Key: "$limit", Value: params.Limit}},
 			}},
 		}}},
 	}
 
-	aggOpts := options.Aggregate().SetAllowDiskUse(true)
-	cursor, err := coll.Aggregate(ctx, pipeline, aggOpts)
+	cursor, err := coll.Aggregate(ctx, psidPipeline)
 	if err != nil {
-		return nil, fmt.Errorf("aggregate: %w", err)
+		return nil, fmt.Errorf("aggregate psids: %w", err)
 	}
-	defer cursor.Close(ctx)
 
 	var facetResults []struct {
 		Metadata []struct {
 			Total int64 `bson:"total"`
 		} `bson:"metadata"`
-		Records []model.DocRecord `bson:"records"`
+		Paged []struct {
+			PSid string `bson:"_id"`
+		} `bson:"paged"`
 	}
 	if err := cursor.All(ctx, &facetResults); err != nil {
-		return nil, fmt.Errorf("decode: %w", err)
+		cursor.Close(ctx)
+		return nil, fmt.Errorf("decode facet: %w", err)
 	}
+	cursor.Close(ctx)
 
 	total := int64(0)
-	records := []model.DocRecord(nil)
+	var pagedPsids []string
 	if len(facetResults) > 0 {
 		if len(facetResults[0].Metadata) > 0 {
 			total = facetResults[0].Metadata[0].Total
 		}
-		records = facetResults[0].Records
+		pagedPsids = make([]string, 0, len(facetResults[0].Paged))
+		for _, p := range facetResults[0].Paged {
+			pagedPsids = append(pagedPsids, p.PSid)
+		}
+	}
+
+	if total == 0 || len(pagedPsids) == 0 {
+		return &QueryResult{Records: nil, Total: total}, nil
+	}
+
+	findFilter := bson.M{"psid": bson.M{"$in": pagedPsids}}
+	findOpts := options.Find().SetSort(bson.D{{Key: "created_at", Value: -1}})
+
+	docsCursor, err := coll.Find(ctx, findFilter, findOpts)
+	if err != nil {
+		return nil, fmt.Errorf("find: %w", err)
+	}
+	defer docsCursor.Close(ctx)
+
+	var records []model.DocRecord
+	if err := docsCursor.All(ctx, &records); err != nil {
+		return nil, fmt.Errorf("decode records: %w", err)
 	}
 
 	return &QueryResult{Records: records, Total: total}, nil
