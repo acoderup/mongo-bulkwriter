@@ -185,13 +185,19 @@ type QueryParams struct {
 
 // QueryResult 查询结果。
 //
-// Records 为类型化的 DocRecord 切片，Total 为符合筛选条件的总记录数（不受 Skip/Limit 影响）。
+// Records 为按 psid 去重后的 DocRecord 切片（相同 psid 仅保留最新一条），
+// Total 为去重后的 psid 总数（不受 Skip/Limit 影响）。
 type QueryResult struct {
-	Records []model.DocRecord `json:"records"` // 查询结果记录列表
-	Total   int64             `json:"total"`   // 符合条件的总记录数
+	Records []model.DocRecord `json:"records"` // 查询结果记录列表（按 psid 去重）
+	Total   int64             `json:"total"`   // 去重后的 psid 总数
 }
 
 // Query 根据指定条件查询记录，按 created_at 倒序排列。
+//
+// 结果按 psid 去重：相同 psid 的多条记录只保留 created_at 最新的一条，
+// 分页（Limit/Skip）和 Total 均以去重后的 psid 个数为准。
+//
+// 使用单次聚合查询（$facet）同时获取 total 和 paged records，避免二次往返。
 //
 // 支持的筛选条件：
 //   - ops: 操作类型精确匹配
@@ -201,7 +207,7 @@ type QueryResult struct {
 //   - created_at 时间范围（CreatedAfter <= created_at <= CreatedBefore）
 //
 // 分页：Limit 默认 100，Skip 用于跳过分页。
-// Total 返回符合条件的总数，不受 Limit/Skip 影响。
+// Total 返回符合条件的去重 psid 总数，不受 Limit/Skip 影响。
 func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryResult, error) {
 	if params.Limit <= 0 {
 		params.Limit = 100
@@ -236,25 +242,50 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 
 	coll := db.Collection(params.Collection)
 
-	total, err := coll.CountDocuments(ctx, filter)
-	if err != nil {
-		return nil, fmt.Errorf("count: %w", err)
+	pipeline := mongo.Pipeline{
+		{{Key: "$match", Value: filter}},
+		{{Key: "$sort", Value: bson.D{{Key: "created_at", Value: -1}}}},
+		{{Key: "$group", Value: bson.D{
+			{Key: "_id", Value: "$psid"},
+			{Key: "doc", Value: bson.M{"$first": "$$ROOT"}},
+		}}},
+		{{Key: "$replaceRoot", Value: bson.M{"newRoot": "$doc"}}},
+		{{Key: "$sort", Value: bson.D{{Key: "created_at", Value: -1}}}},
+		{{Key: "$facet", Value: bson.D{
+			{Key: "metadata", Value: mongo.Pipeline{
+				{{Key: "$count", Value: "total"}},
+			}},
+			{Key: "records", Value: mongo.Pipeline{
+				{{Key: "$skip", Value: params.Skip}},
+				{{Key: "$limit", Value: params.Limit}},
+			}},
+		}}},
 	}
 
-	opts := options.Find().
-		SetSort(bson.D{{Key: "created_at", Value: -1}}).
-		SetLimit(params.Limit).
-		SetSkip(params.Skip)
-
-	cursor, err := coll.Find(ctx, filter, opts)
+	aggOpts := options.Aggregate().SetAllowDiskUse(true)
+	cursor, err := coll.Aggregate(ctx, pipeline, aggOpts)
 	if err != nil {
-		return nil, fmt.Errorf("find: %w", err)
+		return nil, fmt.Errorf("aggregate: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var records []model.DocRecord
-	if err := cursor.All(ctx, &records); err != nil {
+	var facetResults []struct {
+		Metadata []struct {
+			Total int64 `bson:"total"`
+		} `bson:"metadata"`
+		Records []model.DocRecord `bson:"records"`
+	}
+	if err := cursor.All(ctx, &facetResults); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
+	}
+
+	total := int64(0)
+	records := []model.DocRecord(nil)
+	if len(facetResults) > 0 {
+		if len(facetResults[0].Metadata) > 0 {
+			total = facetResults[0].Metadata[0].Total
+		}
+		records = facetResults[0].Records
 	}
 
 	return &QueryResult{Records: records, Total: total}, nil
