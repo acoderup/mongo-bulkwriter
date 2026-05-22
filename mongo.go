@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"sync"
+	"time"
 
 	"github.com/acoderup/mongo-bulkwriter/model"
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -40,6 +41,33 @@ func ConnectMongo(ctx context.Context, uri, dbName string) (*mongo.Client, *mong
 	}
 
 	return client, client.Database(dbName), nil
+}
+
+// Reconnect 断开旧连接并尝试重新连接 MongoDB。
+// 最多重试 maxAttempts 次，每次超时 timeout。全部失败时返回最后一次错误。
+func Reconnect(ctx context.Context, oldClient *mongo.Client, uri, dbName string, maxAttempts int, timeout time.Duration) (*mongo.Client, *mongo.Database, error) {
+	// 断开旧连接，忽略错误
+	if oldClient != nil {
+		oldClient.Disconnect(context.Background())
+	}
+
+	var lastErr error
+	for i := 0; i < maxAttempts; i++ {
+		if i > 0 {
+			log.Printf("[bulkwriter] 重连 Mongo 第 %d/%d 次...", i+1, maxAttempts)
+		}
+
+		pingCtx, cancel := context.WithTimeout(ctx, timeout)
+		client, db, err := ConnectMongo(pingCtx, uri, dbName)
+		cancel()
+
+		if err == nil {
+			log.Println("[bulkwriter] Mongo 重连成功")
+			return client, db, nil
+		}
+		lastErr = err
+	}
+	return nil, nil, fmt.Errorf("重连失败 (%d 次): %w", maxAttempts, lastErr)
 }
 
 // EnsureIndexes 为指定集合显式创建查询索引。幂等操作，可重复调用。

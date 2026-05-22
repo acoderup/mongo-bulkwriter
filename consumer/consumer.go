@@ -69,17 +69,22 @@ func DefaultConfig() Config {
 //   - worker goroutine 池，从队列消费并批量写入
 //   - 信号量控制最大并发 BulkWrite 数
 //   - 运行时指标（接收/丢弃/写入/错误计数）
+//   - 写库失败时自动重连（3 次 × 5 秒）
 //
 // 启动时自动创建 worker 池，Shutdown 时等待队列清空后退出。
 type Handler struct {
-	db        *mongo.Database  // MongoDB 数据库句柄
-	authToken string           // 鉴权令牌
+	client    *mongo.Client   // MongoDB 客户端（用于重连）
+	db        *mongo.Database // MongoDB 数据库句柄
+	uri       string          // Mongo 连接地址（用于重连）
+	dbName    string          // 数据库名（用于重连）
+	authToken string          // 鉴权令牌
 	queue     chan model.Record // 内部缓冲队列
-	sem       chan struct{}    // 并发控制信号量
+	sem       chan struct{}   // 并发控制信号量
 	cfg       Config
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
 	metrics   Metrics
+	reconnMu  sync.Mutex      // 防止并发重连
 }
 
 // Metrics 消费者运行指标。
@@ -103,9 +108,10 @@ type MetricsSnapshot struct {
 
 // NewHandler 创建消费者处理器并启动后台 worker 池。
 //
+// client/uri/dbName 用于写库失败时的自动重连。
 // 自动填充默认配置（零值字段），创建内部队列和信号量，
 // 启动指定数量的 worker goroutine。
-func NewHandler(db *mongo.Database, cfg Config) *Handler {
+func NewHandler(client *mongo.Client, db *mongo.Database, uri, dbName string, cfg Config) *Handler {
 	if cfg.Workers == 0 {
 		cfg.Workers = 32
 	}
@@ -131,7 +137,10 @@ func NewHandler(db *mongo.Database, cfg Config) *Handler {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	h := &Handler{
+		client:    client,
 		db:        db,
+		uri:       uri,
+		dbName:    dbName,
 		authToken: cfg.AuthToken,
 		queue:     make(chan model.Record, cfg.QueueSize),
 		sem:       make(chan struct{}, cfg.MaxConcurrent),
@@ -243,6 +252,22 @@ func (h *Handler) Shutdown() {
 		h.metrics.Received, h.metrics.Dropped, h.metrics.Written, h.metrics.WriteErrors)
 }
 
+// tryReconnect 尝试重新连接 MongoDB（防并发，最多 3 次 × 5 秒）。
+func (h *Handler) tryReconnect() {
+	if !h.reconnMu.TryLock() {
+		return // 已有其他 goroutine 在重连
+	}
+	defer h.reconnMu.Unlock()
+
+	client, db, err := bulkwriter.Reconnect(context.Background(), h.client, h.uri, h.dbName, 3, 5*time.Second)
+	if err != nil {
+		log.Printf("[consumer] 重连失败: %v", err)
+		return
+	}
+	h.client = client
+	h.db = db
+}
+
 // Snapshot 返回当前指标快照（线程安全）。
 func (h *Handler) Snapshot() MetricsSnapshot {
 	h.metrics.mu.RLock()
@@ -291,7 +316,8 @@ func (h *Handler) worker(ctx context.Context, id int) {
 			h.metrics.mu.Lock()
 			if err != nil {
 				h.metrics.WriteErrors++
-				log.Printf("[consumer] bulk write error: %v", err)
+				log.Printf("[consumer] 写库失败: %v，丢弃数据，尝试重连...", err)
+				go h.tryReconnect()
 			} else {
 				h.metrics.Written += int64(written)
 			}

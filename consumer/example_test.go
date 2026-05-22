@@ -21,7 +21,7 @@ func Example() {
 		"mongodb://127.0.0.1:27017", "qstar-history")
 	defer client.Disconnect(context.Background())
 
-	handler := consumer.NewHandler(db, consumer.Config{
+	handler := consumer.NewHandler(client, db, "mongodb://127.0.0.1:27017", "qstar-history", consumer.Config{
 		AuthToken:     authToken,
 		Workers:       32,
 		BatchSize:     500,
