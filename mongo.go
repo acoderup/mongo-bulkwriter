@@ -3,6 +3,7 @@ package bulkwriter
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 
 	"github.com/acoderup/mongo-bulkwriter/model"
@@ -69,9 +70,14 @@ func EnsureIndexes(ctx context.Context, db *mongo.Database, collections ...strin
 //   - {psid, producer_id}
 //   - {ops, psid, producer_id}
 func ensureIndexesFor(ctx context.Context, db *mongo.Database, collName string) error {
+	// 快速路径：已确认存在索引
 	if _, ok := indexedCollections.Load(collName); ok {
 		return nil
 	}
+
+	// 注：以下 Load→CreateMany→Store 之间存在竞态窗口，
+	// 并发首次写入时可能多个 goroutine 同时执行 CreateMany。
+	// CreateMany 对已存在索引是幂等操作，仅浪费一次 List 调用，不影响正确性。
 
 	coll := db.Collection(collName)
 
@@ -138,17 +144,8 @@ func BulkInsert(ctx context.Context, db *mongo.Database, records []model.Record)
 		if collName == "" {
 			collName = "default"
 		}
-		doc := model.DocRecord{
-			Ops:        r.Ops,
-			PSid:       r.PSid,
-			ProducerID: r.ProducerID,
-			Tba:        r.Tba,
-			Tid:        r.Tid,
-			Twla:       r.Twla,
-			Gd:         r.Gd,
-			CreatedAt:  r.CreatedAt,
-		}
-		groups[collName] = append(groups[collName], mongo.NewInsertOneModel().SetDocument(doc))
+		groups[collName] = append(groups[collName],
+			mongo.NewInsertOneModel().SetDocument(r.ToDocRecord()))
 	}
 
 	opts := options.BulkWrite().SetOrdered(false)
@@ -265,6 +262,7 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 	if err != nil {
 		return nil, fmt.Errorf("aggregate psids: %w", err)
 	}
+	defer cursor.Close(ctx)
 
 	var facetResults []struct {
 		Metadata []struct {
@@ -275,10 +273,8 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 		} `bson:"paged"`
 	}
 	if err := cursor.All(ctx, &facetResults); err != nil {
-		cursor.Close(ctx)
 		return nil, fmt.Errorf("decode facet: %w", err)
 	}
-	cursor.Close(ctx)
 
 	total := int64(0)
 	var pagedPsids []string
@@ -331,4 +327,73 @@ func FindOne(ctx context.Context, db *mongo.Database, collection string, filter 
 		return nil, fmt.Errorf("findOne: %w", err)
 	}
 	return &doc, nil
+}
+
+// DeleteOldRecords 分批删除 collection 中 created_at < before 的记录。
+//
+// 适用于千万级数据：每批取 batchSize 条 _id，再按 _id 精确删除，
+// 避免单次 DeleteMany 长时间锁库。批次间检查 ctx.Done() 支持取消。
+// created_at 字段必须有索引。
+func DeleteOldRecords(ctx context.Context, db *mongo.Database, collection string, before int64) (int64, error) {
+	const batchSize = 10000
+
+	if collection == "" {
+		collection = "default"
+	}
+
+	coll := db.Collection(collection)
+	filter := bson.M{"created_at": bson.M{"$lt": before}}
+	findOpts := options.Find().
+		SetLimit(batchSize).
+		SetProjection(bson.M{"_id": 1})
+	var total int64
+	batchNum := 0
+
+	for {
+		select {
+		case <-ctx.Done():
+			return total, ctx.Err()
+		default:
+		}
+
+		cursor, err := coll.Find(ctx, filter, findOpts)
+		if err != nil {
+			return total, fmt.Errorf("find batch: %w", err)
+		}
+
+		ids := make([]any, 0, batchSize)
+		for cursor.Next(ctx) {
+			var doc struct {
+				ID any `bson:"_id"`
+			}
+			if err := cursor.Decode(&doc); err != nil {
+				cursor.Close(ctx)
+				return total, fmt.Errorf("decode id: %w", err)
+			}
+			ids = append(ids, doc.ID)
+		}
+		cursor.Close(ctx)
+
+		if len(ids) == 0 {
+			break
+		}
+
+		result, err := coll.DeleteMany(ctx, bson.M{"_id": bson.M{"$in": ids}})
+		if err != nil {
+			return total, fmt.Errorf("delete batch: %w", err)
+		}
+		total += result.DeletedCount
+		batchNum++
+
+		if batchNum%10 == 0 {
+			log.Printf("[bulkwriter] %s: 已删除 %d 条 (%d 批次)", collection, total, batchNum)
+		}
+	}
+
+	return total, nil
+}
+
+// ListCollections 返回数据库中所有集合名称。
+func ListCollections(ctx context.Context, db *mongo.Database) ([]string, error) {
+	return db.ListCollectionNames(ctx, bson.M{})
 }

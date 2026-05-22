@@ -72,10 +72,10 @@ func DefaultConfig() Config {
 //
 // 启动时自动创建 worker 池，Shutdown 时等待队列清空后退出。
 type Handler struct {
-	db        *mongo.Database // MongoDB 数据库句柄
-	authToken string          // 鉴权令牌
+	db        *mongo.Database  // MongoDB 数据库句柄
+	authToken string           // 鉴权令牌
 	queue     chan model.Record // 内部缓冲队列
-	sem       chan struct{}   // 并发控制信号量
+	sem       chan struct{}    // 并发控制信号量
 	cfg       Config
 	wg        sync.WaitGroup
 	cancel    context.CancelFunc
@@ -85,6 +85,15 @@ type Handler struct {
 // Metrics 消费者运行指标。
 type Metrics struct {
 	mu          sync.RWMutex
+	Received    int64 // 接收记录总数
+	Dropped     int64 // 因队列满或空字段丢弃数
+	Written     int64 // 成功写入 Mongo 数
+	WriteErrors int64 // 写入失败数
+	QueueLen    int   // 当前队列长度
+}
+
+// MetricsSnapshot 消费者指标快照（不含 mutex，安全返回给外部）。
+type MetricsSnapshot struct {
 	Received    int64 // 接收记录总数
 	Dropped     int64 // 因队列满或空字段丢弃数
 	Written     int64 // 成功写入 Mongo 数
@@ -187,29 +196,24 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 非阻塞入队
-	var queued int
+	// 非阻塞入队：局部累积后一次性更新指标，避免逐条加锁
+	var queued, dropped int
 	for _, record := range req.Records {
-		// 必填字段校验
 		if record.Collection == "" || record.Ops == "" || record.PSid == "" {
-			h.metrics.mu.Lock()
-			h.metrics.Dropped++
-			h.metrics.mu.Unlock()
+			dropped++
 			continue
 		}
 		select {
 		case h.queue <- record:
 			queued++
 		default:
-			// 队列满，丢弃
-			h.metrics.mu.Lock()
-			h.metrics.Dropped++
-			h.metrics.mu.Unlock()
+			dropped++
 		}
 	}
 
 	h.metrics.mu.Lock()
 	h.metrics.Received += int64(queued)
+	h.metrics.Dropped += int64(dropped)
 	h.metrics.mu.Unlock()
 
 	// 过载保护：全部丢弃时返回 429
@@ -220,7 +224,7 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+	writeJSON(w, http.StatusAccepted, map[string]any{
 		"written": 0,
 		"queued":  queued,
 	})
@@ -239,11 +243,11 @@ func (h *Handler) Shutdown() {
 		h.metrics.Received, h.metrics.Dropped, h.metrics.Written, h.metrics.WriteErrors)
 }
 
-// MetricsSnapshot 返回当前指标快照（线程安全）。
-func (h *Handler) MetricsSnapshot() Metrics {
+// Snapshot 返回当前指标快照（线程安全）。
+func (h *Handler) Snapshot() MetricsSnapshot {
 	h.metrics.mu.RLock()
 	defer h.metrics.mu.RUnlock()
-	return Metrics{
+	return MetricsSnapshot{
 		Received:    h.metrics.Received,
 		Dropped:     h.metrics.Dropped,
 		Written:     h.metrics.Written,
@@ -278,8 +282,10 @@ func (h *Handler) worker(ctx context.Context, id int) {
 		copy(b, batch)
 
 		h.sem <- struct{}{}
+		h.wg.Add(1)
 		go func(records []model.Record) {
 			defer func() { <-h.sem }()
+			defer h.wg.Done()
 
 			written, err := bulkwriter.BulkInsert(ctx, h.db, records)
 			h.metrics.mu.Lock()
@@ -291,7 +297,7 @@ func (h *Handler) worker(ctx context.Context, id int) {
 			}
 			h.metrics.mu.Unlock()
 		}(b)
-		batch = make([]model.Record, 0, h.cfg.BatchSize)
+		batch = batch[:0]
 		batchBytes = 0
 	}
 
@@ -317,8 +323,10 @@ func (h *Handler) worker(ctx context.Context, id int) {
 }
 
 // writeJSON 写入 JSON 响应。
-func writeJSON(w http.ResponseWriter, status int, v interface{}) {
+func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		log.Printf("[consumer] writeJSON error: %v", err)
+	}
 }

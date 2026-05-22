@@ -74,12 +74,11 @@ func DefaultConfig(consumerURL string) Config {
 // 内部维护一个缓冲 channel 和一个后台 flusher goroutine。
 // 并发安全：Send 可在多个 goroutine 中同时调用。
 type Client struct {
-	cfg       Config
-	authToken string
-	queue     chan Record       // 本地缓冲队列
-	client    *http.Client      // HTTP 客户端（5s 超时）
-	wg        sync.WaitGroup
-	cancel    context.CancelFunc
+	cfg    Config
+	queue  chan Record  // 本地缓冲队列
+	client *http.Client // HTTP 客户端（5s 超时）
+	wg     sync.WaitGroup
+	cancel context.CancelFunc
 }
 
 // New 创建生产者客户端并启动后台发送 goroutine。
@@ -102,11 +101,10 @@ func New(cfg Config) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	c := &Client{
-		cfg:       cfg,
-		authToken: cfg.AuthToken,
-		queue:     make(chan Record, cfg.QueueSize),
-		client:    &http.Client{Timeout: 5 * time.Second},
-		cancel:    cancel,
+		cfg:    cfg,
+		queue:  make(chan Record, cfg.QueueSize),
+		client: &http.Client{Timeout: 5 * time.Second},
+		cancel: cancel,
 	}
 
 	c.wg.Add(1)
@@ -168,7 +166,7 @@ func (c *Client) flusher(ctx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		if err := c.sendBatch(batch); err != nil {
+		if err := c.sendBatch(ctx, batch); err != nil {
 			log.Printf("[producer] send error: %v", err)
 		}
 		batch = batch[:0]
@@ -178,13 +176,23 @@ func (c *Client) flusher(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			flush() // 关闭前刷出剩余数据
+			// 关闭时用独立 context，避免因 ctx 已取消而丢失最后一批
+			if len(batch) > 0 {
+				finalCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				c.sendBatch(finalCtx, batch)
+				cancel()
+			}
 			return
 		case <-ticker.C:
 			flush() // 定时刷新
 		case record, ok := <-c.queue:
 			if !ok {
-				flush()
+				// channel 关闭时同样用独立 context
+				if len(batch) > 0 {
+					finalCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					c.sendBatch(finalCtx, batch)
+					cancel()
+				}
 				return
 			}
 			batch = append(batch, record)
@@ -200,7 +208,7 @@ func (c *Client) flusher(ctx context.Context) {
 //
 // 重试策略：递增退避 100ms → 200ms → 300ms。
 // 自动携带 X-Auth-Token 鉴权头（如已配置）。
-func (c *Client) sendBatch(batch []Record) error {
+func (c *Client) sendBatch(ctx context.Context, batch []Record) error {
 	body, err := json.Marshal(model.IngestRequest{Records: batch})
 	if err != nil {
 		return err
@@ -208,18 +216,21 @@ func (c *Client) sendBatch(batch []Record) error {
 
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt*100) * time.Millisecond)
 		}
 
-		req, err := http.NewRequest(http.MethodPost, c.cfg.ConsumerURL, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.cfg.ConsumerURL, bytes.NewReader(body))
 		if err != nil {
 			lastErr = err
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
-		if c.authToken != "" {
-			req.Header.Set("X-Auth-Token", c.authToken)
+		if c.cfg.AuthToken != "" {
+			req.Header.Set("X-Auth-Token", c.cfg.AuthToken)
 		}
 
 		resp, err := c.client.Do(req)

@@ -38,6 +38,20 @@ type DocRecord struct {
 	CreatedAt  int64   `bson:"created_at"`  // 创建时间（Unix 毫秒时间戳）
 }
 
+// ToDocRecord 将 Record 转为 MongoDB 文档结构。
+func (r Record) ToDocRecord() DocRecord {
+	return DocRecord{
+		Ops:        r.Ops,
+		PSid:       r.PSid,
+		ProducerID: r.ProducerID,
+		Tba:        r.Tba,
+		Tid:        r.Tid,
+		Twla:       r.Twla,
+		Gd:         r.Gd,
+		CreatedAt:  r.CreatedAt,
+	}
+}
+
 // IngestRequest 是消费者接收的批量写入请求。
 //
 // POST /bulkwriter/ingest 的请求体格式。
