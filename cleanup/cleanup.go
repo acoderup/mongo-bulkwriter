@@ -103,8 +103,10 @@ func run(ctx context.Context, db *mongo.Database, retentionDays int) {
 			log.Printf("[cleanup] 清理 %s 失败: %v", col, err)
 			continue
 		}
-		log.Printf("[cleanup] %s: 删除 %d 条", col, deleted)
-		totalDeleted += deleted
+			if deleted > 0 {
+				log.Printf("[cleanup] %s: 删除 %d 条", col, deleted)
+			}
+			totalDeleted += deleted
 	}
 
 	log.Printf("[cleanup] 清理完成，共删除 %d 条记录", totalDeleted)
