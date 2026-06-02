@@ -46,6 +46,14 @@ type Config struct {
 	QueueSize     int           // 内部缓冲队列大小，默认 50000
 	MaxConcurrent int           // 最大并发 Mongo BulkWrite 数，默认 16
 	MaxBodySize   int64         // 请求体最大字节数（硬限制），默认 10MB
+
+	// DefaultIndexes 全局默认索引，未注册集合首次写入时自动创建。
+	// 格式："field"=升序，"-field"=降序，"a,b"=复合。
+	// 为空则使用库内置 DefaultSchema。
+	DefaultIndexes []string
+
+	// CollectionIndexes 指定集合的索引覆盖，key=集合名。
+	CollectionIndexes map[string][]string
 }
 
 // DefaultConfig 返回推荐配置。
@@ -136,6 +144,14 @@ func NewHandler(client *mongo.Client, db *mongo.Database, uri, dbName string, cf
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// 应用索引配置（在 worker 启动前，确保首次写入时索引已就绪）
+	if len(cfg.DefaultIndexes) > 0 {
+		bulkwriter.SetDefaultIndexes(cfg.DefaultIndexes...)
+	}
+	for coll, indexes := range cfg.CollectionIndexes {
+		bulkwriter.SetCollectionIndexes(coll, indexes...)
+	}
 
 	h := &Handler{
 		client:    client,
