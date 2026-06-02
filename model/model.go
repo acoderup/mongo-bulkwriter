@@ -58,6 +58,9 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 		r.Collection = f.Collection
 		r.ProducerID = f.ProducerID
 		r.CreatedAt = f.CreatedAt
+		// 剔除基础设施字段，避免 BSON inline 时与 DocRecord 固定字段冲突
+		delete(f.Fields, "producer_id")
+		delete(f.Fields, "created_at")
 		r.Fields = f.Fields
 		return nil
 	}
@@ -109,6 +112,11 @@ type DocRecord struct {
 
 // ToDocRecord 将 Record 转为 MongoDB 文档结构。
 func (r Record) ToDocRecord() DocRecord {
+	// 防御：剔除可能与 DocRecord 固定字段冲突的 key
+	if r.Fields != nil {
+		delete(r.Fields, "producer_id")
+		delete(r.Fields, "created_at")
+	}
 	return DocRecord{
 		ProducerID: r.ProducerID,
 		CreatedAt:  r.CreatedAt,
