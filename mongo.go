@@ -422,8 +422,27 @@ func ListCollections(ctx context.Context, db *mongo.Database) ([]string, error) 
 }
 
 // ──────────────────────────────────────────────
-// 顶层封装：一个函数完成 Schema 注册
+// 顶层封装：索引配置 + Schema 注册
 // ──────────────────────────────────────────────
+
+// SetDefaultIndexes 设置全局默认索引，替代 DefaultSchema。
+//
+// 所有未显式注册 Schema 的集合，首次写入时自动按此配置创建索引。
+// 应在应用启动时调用一次，后续调用会覆盖之前的配置。
+//
+//	bulkwriter.SetDefaultIndexes("ops", "psid", "-created_at")
+func SetDefaultIndexes(indexes ...string) {
+	s := &model.Schema{
+		Name:    "default",
+		Indexes: parseIndexes(indexes),
+	}
+	model.DefaultRegistry.SetDefault(s)
+}
+
+// SetCollectionIndexes 为指定集合配置索引（RegisterSchema 的别名，语义更清晰）。
+func SetCollectionIndexes(collection string, indexes ...string) *model.Schema {
+	return RegisterSchema(collection, indexes...)
+}
 
 // parseIndexes 将字符串索引转为 IndexDefinition。
 // 格式："field"=升序，"-field"=降序，"a,b"=复合升序，"-a,-b"=复合降序。

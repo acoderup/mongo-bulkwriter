@@ -176,6 +176,13 @@ func (r *SchemaRegistry) Register(collection string, s *Schema) {
 	r.schemas[collection] = s
 }
 
+// SetDefault 替换默认 Schema，不影响已注册的 collection。
+func (r *SchemaRegistry) SetDefault(s *Schema) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.defaults = s
+}
+
 // Get 获取指定 collection 的 Schema，未注册则返回默认 Schema。
 func (r *SchemaRegistry) Get(collection string) *Schema {
 	r.mu.RLock()

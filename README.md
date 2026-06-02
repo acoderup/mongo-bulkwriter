@@ -37,8 +37,8 @@ import (
 client, db, _ := bulkwriter.ConnectMongo(ctx, "mongodb://127.0.0.1:27017", "qstar-history")
 defer client.Disconnect(ctx)
 
-// 2. 注册 Schema（一行指定索引字段）
-bulkwriter.RegisterSchema("bets", "ops", "psid", "producer_id", "tid", "-created_at")
+// 2. 配置默认索引（所有集合首次写入时自动创建）
+bulkwriter.SetDefaultIndexes("ops", "psid", "producer_id", "tid", "-created_at")
 
 // 3. 创建消费者（内置 worker 池、并发控制、重连、鉴权）
 handler := consumer.NewHandler(client, db, "mongodb://127.0.0.1:27017", "qstar-history",
@@ -86,8 +86,8 @@ client.Send(producer.Record{
 ### 直接写入（不走 HTTP）
 
 ```go
-// 一行注册 Schema
-bulkwriter.RegisterSchema("logs", "ops", "psid", "-created_at")
+// 配置默认索引
+bulkwriter.SetDefaultIndexes("ops", "psid", "-created_at")
 
 // 用 NewRecord 快速创建记录
 bulkwriter.BulkInsert(ctx, db, []bulkwriter.Record{
@@ -99,13 +99,15 @@ bulkwriter.BulkInsert(ctx, db, []bulkwriter.Record{
 })
 ```
 
-### 批量配置多个 Schema
+### 集合粒度配置
 
 ```go
-bulkwriter.Configure(
-    bulkwriter.SchemaConfig{Collection: "bet_logs", Indexes: []string{"ops", "psid", "-created_at"}},
-    bulkwriter.SchemaConfig{Collection: "pay_logs", Indexes: []string{"order_id", "user_id", "-created_at"}},
-)
+// 全局默认
+bulkwriter.SetDefaultIndexes("-created_at")
+
+// 不同集合按需覆盖
+bulkwriter.SetCollectionIndexes("bet_logs", "ops", "psid", "-created_at")
+bulkwriter.SetCollectionIndexes("pay_logs", "order_id", "user_id", "-created_at")
 ```
 
 ### 查询
@@ -162,11 +164,9 @@ defer stop()
 
 ### 概述
 
-索引由 `SchemaRegistry` 驱动。未注册 Schema 的集合自动使用 `DefaultSchema`（向后兼容），自定义 Schema 通过 `RegisterSchema` 或 `Configure` 注册。
+索引由 `SchemaRegistry` 驱动，首次写入集合时自动创建。`sync.Map` 进程内缓存 + 幂等检查，避免重复创建。
 
 ### 索引字段规则
-
-索引字段使用纯字符串，内部自动转为 MongoDB 索引键：
 
 | 格式 | 含义 | MongoDB 索引 |
 |------|------|-------------|
@@ -175,50 +175,32 @@ defer stop()
 | `"a,b"` | 复合升序 | `{a: 1, b: 1}` |
 | `"-a,-b"` | 复合降序 | `{a: -1, b: -1}` |
 
-**规则：**
-- 前缀 `-` 表示降序，不加前缀为升序
-- 逗号 `,` 分隔复合索引的多个字段
-- 复合索引中的所有字段必须同向（全升或全降），跨向复合索引用 `model.Idx(bson.D{...})` 创建
-- 索引创建是幂等的，重复调用不会重复创建
-- 首次写入集合时自动创建，`sync.Map` 进程内缓存避免重复检查
+- 前缀 `-` 表示降序，不加前缀为升序；逗号 `,` 分隔复合索引字段
+- 复合索引所有字段必须同向（全升或全降），跨向复合索引需用 `model.Idx(bson.D{...})`
 
-### 注册方式
+### 配置方式
 
-**方式 1：`RegisterSchema` — 一行注册**
+**方式 1：`SetDefaultIndexes` — 全局默认（推荐）**
 
 ```go
-bulkwriter.RegisterSchema("pay_logs", "order_id", "user_id", "-created_at")
+// main.go 启动时一行配置，所有未注册集合自动使用
+bulkwriter.SetDefaultIndexes("ops", "psid", "producer_id", "tid", "-created_at")
 ```
 
-参数：`(collection名称, 索引字段1, 索引字段2, ...)`
-
-**方式 2：`Configure` — 批量注册**
+**方式 2：`SetCollectionIndexes` — 指定集合覆盖**
 
 ```go
-bulkwriter.Configure(
-    bulkwriter.SchemaConfig{
-        Collection: "bet_logs",
-        Indexes:    []string{"ops", "psid", "-created_at"},
-    },
-    bulkwriter.SchemaConfig{
-        Collection: "pay_logs",
-        Indexes:    []string{"order_id", "-created_at"},
-        Validate: func(r *model.Record) error {
-            if r.Fields["order_id"] == nil {
-                return errors.New("缺少 order_id")
-            }
-            return nil
-        },
-    },
-)
+// 为特定集合定制索引，覆盖全局默认
+bulkwriter.SetCollectionIndexes("pg_126", "ops", "-created_at")         // 只需两个索引
+bulkwriter.SetCollectionIndexes("pay_logs", "order_id", "user_id", "-created_at")
 ```
 
-**方式 3：`SchemaBuilder` — 完整控制**
+**方式 3：`SchemaBuilder` — 唯一索引 / 复杂校验**
 
 ```go
 model.NewSchema("payment").
-    WithIndex(model.Asc("order_id")).           // 升序
-    WithIndex(model.Desc("created_at"), true).  // 降序 + 唯一索引
+    WithIndex(model.Asc("order_id")).
+    WithIndex(model.Desc("created_at"), true).  // true = 唯一索引
     WithValidate(func(r *model.Record) error {
         if r.Fields["order_id"] == nil {
             return errors.New("缺少 order_id")
@@ -228,7 +210,19 @@ model.NewSchema("payment").
     Register("pay_logs")
 ```
 
-只导入根包 `bulkwriter` 时用方式 1 和 2，需要唯一索引或混合向复合索引时用方式 3。
+### 去重机制
+
+索引创建全程去重：
+1. `sync.Map` 进程级缓存：同一集合只检查一次
+2. `Indexes().List()` 幂等检查：已存在的索引不重复创建
+3. `CreateMany` 幂等操作：并发竞态不会导致错误
+
+### 校验规则
+
+每条记录写入前经过两级校验：
+
+1. **基础设施校验**（始终生效）：`Collection` 为空 → 丢弃
+2. **Schema 校验**（可选）：`Schema.Validate` 不为 nil 时执行，返回 error → 丢弃
 
 ### 默认 Schema
 
@@ -410,10 +404,10 @@ client := producer.New(producer.Config{AuthToken: "my-secret"})
 client, db, _ := bulkwriter.ConnectMongo(ctx, uri, dbName)
 client, db, _ := bulkwriter.Reconnect(ctx, oldClient, uri, dbName, maxAttempts, timeout)
 
-// ── Schema 注册 ──
-bulkwriter.RegisterSchema("coll", "f1", "f2", "-f3")          // 字符串索引
-bulkwriter.Configure(schemaConfigs...)                          // 批量注册
-bulkwriter.EnsureIndexes(ctx, db, "coll_a", "coll_b")          // 手动建索引
+// ── 索引配置 ──
+bulkwriter.SetDefaultIndexes("f1", "f2", "-f3")                // 全局默认索引
+bulkwriter.SetCollectionIndexes("coll", "f1", "-f2")           // 指定集合覆盖
+bulkwriter.RegisterSchema("coll", "f1", "f2")                  // 注册 Schema（同上）
 
 // ── 写入 ──
 rec := bulkwriter.NewRecord("coll", map[string]interface{}{"k": "v"})
