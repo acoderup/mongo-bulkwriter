@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/acoderup/mongo-bulkwriter"
-	"github.com/acoderup/mongo-bulkwriter/model"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 )
 
@@ -125,16 +124,18 @@ func TestQueryThroughput(t *testing.T) {
 
 	// 先写入 5 万条测试数据
 	ops := "bench_query"
-	records := make([]model.Record, 50000)
+	records := make([]bulkwriter.Record, 50000)
 	now := time.Now().UnixMilli()
 	for i := range records {
-		records[i] = model.Record{
+		records[i] = bulkwriter.Record{
 			Collection: "bench",
-			Ops:        ops,
-			PSid:       fmt.Sprintf("s_%d", i%100),
-			Tid:        fmt.Sprintf("t_%d", i),
-			Gd:         `{"test":true}`,
 			CreatedAt:  now,
+			Fields: map[string]interface{}{
+				"ops":  ops,
+				"psid": fmt.Sprintf("s_%d", i%100),
+				"tid":  fmt.Sprintf("t_%d", i),
+				"gd":   `{"test":true}`,
+			},
 		}
 	}
 	if _, err := bulkwriter.BulkInsert(ctx, db, records); err != nil {
@@ -166,20 +167,22 @@ func TestQueryThroughput(t *testing.T) {
 }
 
 // makeRecords 生成 n 条测试记录。
-func makeRecords(n int) []model.Record {
-	records := make([]model.Record, n)
+func makeRecords(n int) []bulkwriter.Record {
+	records := make([]bulkwriter.Record, n)
 	now := time.Now().UnixMilli()
 	for i := range records {
-		records[i] = model.Record{
+		records[i] = bulkwriter.Record{
 			Collection: "bench",
-			Ops:        "bench",
-			PSid:       fmt.Sprintf("s_%d", i%1000),
-			ProducerID: i % 10,
-			Tba:        float64(i%100) + 0.5,
-			Tid:        fmt.Sprintf("t_%d_%d", now, i),
-			Twla:       float64(i%90) + 0.5,
-			Gd:         fmt.Sprintf(`{"gid":%d,"cc":"VND","msg":"record_%d"}`, i%200, i),
 			CreatedAt:  now,
+			Fields: map[string]interface{}{
+				"ops":         "bench",
+				"psid":        fmt.Sprintf("s_%d", i%1000),
+				"producer_id": i % 10,
+				"tba":         float64(i%100) + 0.5,
+				"tid":         fmt.Sprintf("t_%d_%d", now, i),
+				"twla":        float64(i%90) + 0.5,
+				"gd":          fmt.Sprintf(`{"gid":%d,"cc":"VND","msg":"record_%d"}`, i%200, i),
+			},
 		}
 	}
 	return records

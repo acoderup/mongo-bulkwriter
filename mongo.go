@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +14,9 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/writeconcern"
 )
+
+// Record 类型别名，方便用户直接使用 bulkwriter.Record 而无需导入 model 包。
+type Record = model.Record
 
 // indexedCollections 记录当前进程已确认存在索引的集合（进程内缓存，避免重复查询 Mongo）。
 var indexedCollections sync.Map
@@ -83,20 +87,10 @@ func EnsureIndexes(ctx context.Context, db *mongo.Database, collections ...strin
 	return nil
 }
 
-// ensureIndexesFor 为单个集合创建查询索引，自动跳过已存在的索引。
+// ensureIndexesFor 为单个集合按注册的 Schema 创建查询索引，自动跳过已存在的索引。
 //
-// 创建的单字段索引：
-//   - ops: 按操作类型查询
-//   - psid: 按项目/会话标识查询
-//   - producer_id: 按生产者编号查询
-//   - tid: 按记录ID查询
-//   - created_at: 时间倒序排序
-//
-// 创建的复合索引：
-//   - {ops, psid}
-//   - {ops, producer_id}
-//   - {psid, producer_id}
-//   - {ops, psid, producer_id}
+// 索引列表由 SchemaRegistry 中的 Schema.Indexes 决定，未注册则使用默认 Schema。
+// 首次调用时创建索引，进程内缓存已创建的集合名，后续调用自动跳过。
 func ensureIndexesFor(ctx context.Context, db *mongo.Database, collName string) error {
 	// 快速路径：已确认存在索引
 	if _, ok := indexedCollections.Load(collName); ok {
@@ -127,16 +121,11 @@ func ensureIndexesFor(ctx context.Context, db *mongo.Database, collName string) 
 		}
 	}
 
-	wanted := []mongo.IndexModel{
-		{Keys: bson.D{{Key: "ops", Value: 1}}},
-		{Keys: bson.D{{Key: "psid", Value: 1}}},
-		{Keys: bson.D{{Key: "producer_id", Value: 1}}},
-		{Keys: bson.D{{Key: "ops", Value: 1}, {Key: "psid", Value: 1}}},
-		{Keys: bson.D{{Key: "ops", Value: 1}, {Key: "producer_id", Value: 1}}},
-		{Keys: bson.D{{Key: "psid", Value: 1}, {Key: "producer_id", Value: 1}}},
-		{Keys: bson.D{{Key: "ops", Value: 1}, {Key: "psid", Value: 1}, {Key: "producer_id", Value: 1}}},
-		{Keys: bson.D{{Key: "created_at", Value: -1}}},
-		{Keys: bson.D{{Key: "tid", Value: 1}}},
+	// 从 Registry 获取 Schema 的索引定义
+	schema := model.DefaultRegistry.Get(collName)
+	wanted := make([]mongo.IndexModel, 0, len(schema.Indexes))
+	for _, def := range schema.Indexes {
+		wanted = append(wanted, def.ToMongoIndex())
 	}
 
 	var toCreate []mongo.IndexModel
@@ -195,7 +184,8 @@ func BulkInsert(ctx context.Context, db *mongo.Database, records []model.Record)
 // QueryParams 查询参数。
 //
 // 所有筛选条件均为可选，未设置的条件不参与筛选。
-// 支持时间范围、分页、多条件联合查询。
+// 便捷字段（Ops/PSid 等）与 Filter 同时生效（AND 逻辑）。
+// 分页以 psid 去重个数为准，适用于投注类按 psid 分组的场景。
 type QueryParams struct {
 	Collection    string // 要查询的集合（必填，为空默认 "default"）
 	Ops           string // 按 ops 筛选（可选）
@@ -206,6 +196,7 @@ type QueryParams struct {
 	CreatedBefore int64  // 按 created_at <= 筛选（Unix 毫秒时间戳，可选，0 表示不筛选）
 	Limit         int64  // 返回条数限制，默认 100
 	Skip          int64  // 跳过条数，用于分页
+	Filter        bson.M // 自定义筛选条件，与便捷字段合并（可选）
 }
 
 // QueryResult 查询结果。
@@ -264,6 +255,10 @@ func Query(ctx context.Context, db *mongo.Database, params QueryParams) (*QueryR
 			createdFilter["$lte"] = params.CreatedBefore
 		}
 		filter["created_at"] = createdFilter
+	}
+	// 合并自定义 Filter（与便捷字段 AND 逻辑）
+	for k, v := range params.Filter {
+		filter[k] = v
 	}
 
 	coll := db.Collection(params.Collection)
@@ -424,4 +419,84 @@ func DeleteOldRecords(ctx context.Context, db *mongo.Database, collection string
 // ListCollections 返回数据库中所有集合名称。
 func ListCollections(ctx context.Context, db *mongo.Database) ([]string, error) {
 	return db.ListCollectionNames(ctx, bson.M{})
+}
+
+// ──────────────────────────────────────────────
+// 顶层封装：一个函数完成 Schema 注册
+// ──────────────────────────────────────────────
+
+// parseIndexes 将字符串索引转为 IndexDefinition。
+// 格式："field"=升序，"-field"=降序，"a,b"=复合升序，"-a,-b"=复合降序。
+func parseIndexes(indexes []string) []model.IndexDefinition {
+	defs := make([]model.IndexDefinition, 0, len(indexes))
+	for _, idx := range indexes {
+		parts := strings.Split(idx, ",")
+		desc := strings.HasPrefix(parts[0], "-")
+		fields := make([]string, len(parts))
+		for i, p := range parts {
+			fields[i] = strings.TrimPrefix(p, "-")
+		}
+		if desc {
+			defs = append(defs, model.Idx(model.Desc(fields...)))
+		} else {
+			defs = append(defs, model.Idx(model.Asc(fields...)))
+		}
+	}
+	return defs
+}
+
+// SchemaConfig 定义单个集合的 Schema 配置。
+type SchemaConfig struct {
+	Collection string                      // 集合名
+	Indexes    []string                    // 索引字段："field"=升序，"-field"=降序
+	Validate   func(r *model.Record) error  // 可选校验
+}
+
+// RegisterSchema 为集合注册 Schema，只需传入索引字段名。
+//
+// 格式： "field" = 升序索引，"-field" = 降序索引，"a,b" = 复合索引。
+//
+//	bulkwriter.RegisterSchema("pay_logs", "order_id", "user_id", "-created_at")
+func RegisterSchema(collection string, indexes ...string) *model.Schema {
+	s := &model.Schema{
+		Name:    collection,
+		Indexes: parseIndexes(indexes),
+	}
+	model.DefaultRegistry.Register(collection, s)
+	return s
+}
+
+// Configure 批量注册 Schema 配置。
+//
+//	bulkwriter.Configure(
+//	    bulkwriter.SchemaConfig{Collection: "bet_logs", Indexes: []string{"ops", "psid", "-created_at"}},
+//	    bulkwriter.SchemaConfig{Collection: "pay_logs", Indexes: []string{"order_id", "-created_at"}},
+//	)
+func Configure(schemas ...SchemaConfig) {
+	for _, sc := range schemas {
+		s := &model.Schema{
+			Name:     sc.Collection,
+			Indexes:  parseIndexes(sc.Indexes),
+			Validate: sc.Validate,
+		}
+		model.DefaultRegistry.Register(sc.Collection, s)
+	}
+}
+
+// NewRecord 快速创建一条记录。
+func NewRecord(collection string, fields map[string]interface{}) model.Record {
+	return model.Record{
+		Collection: collection,
+		CreatedAt:  time.Now().UnixMilli(),
+		Fields:     fields,
+	}
+}
+
+// NewRecordWithTime 快速创建带自定义时间的记录。
+func NewRecordWithTime(collection string, createdAt int64, fields map[string]interface{}) model.Record {
+	return model.Record{
+		Collection: collection,
+		CreatedAt:  createdAt,
+		Fields:     fields,
+	}
 }

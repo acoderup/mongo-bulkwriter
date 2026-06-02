@@ -25,48 +25,47 @@ func Example() {
 	})
 	defer client.Close()
 
-	// 有效记录
+	// 有效记录：业务字段通过 Fields 传入
 	client.Send(producer.Record{
 		Collection: "access_logs",
-		Ops:        "access",
-		PSid:        "service_a",
-		ProducerID: 1,
-		Gd:       "POST /api/verify ip=192.168.1.1 status=200",
 		CreatedAt:  time.Now().UnixMilli(),
+		Fields: map[string]interface{}{
+			"ops":         "access",
+			"psid":        "service_a",
+			"producer_id": 1,
+			"gd":          "POST /api/verify ip=192.168.1.1 status=200",
+		},
 	})
 
-	// 有效记录（Data 为 JSON 字符串）
 	client.Send(producer.Record{
 		Collection: "events",
-		Ops:        "login",
-		PSid:        "user_123",
-		ProducerID: 1,
-		Gd:       `{"event":"user_login","uid":"user_123"}`,
 		CreatedAt:  time.Now().UnixMilli(),
+		Fields: map[string]interface{}{
+			"ops":         "login",
+			"psid":        "user_123",
+			"producer_id": 1,
+			"gd":          `{"event":"user_login","uid":"user_123"}`,
+		},
 	})
 
-	// 有效记录
 	client.Send(producer.Record{
 		Collection: "metrics",
-		Ops:        "metric",
-		PSid:        "monitor",
-		ProducerID: 2,
-		Gd:       "cpu=45.2 mem=72.1",
 		CreatedAt:  time.Now().UnixMilli(),
+		Fields: map[string]interface{}{
+			"ops":         "metric",
+			"psid":        "monitor",
+			"producer_id": 2,
+			"gd":          "cpu=45.2 mem=72.1",
+		},
 	})
 
 	// 无效记录：Collection 为空 → 丢弃 + 错误日志
 	client.Send(producer.Record{
-		Ops:  "test",
-		PSid:  "x",
-		Gd: "missing collection",
-	})
-
-	// 无效记录：Ops 为空 → 丢弃 + 错误日志
-	client.Send(producer.Record{
-		Collection: "test",
-		PSid:        "x",
-		Gd:       "missing ops",
+		Fields: map[string]interface{}{
+			"ops":  "test",
+			"psid": "x",
+			"gd":   "missing collection",
+		},
 	})
 
 	sig := make(chan os.Signal, 1)

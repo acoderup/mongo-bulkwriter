@@ -8,7 +8,7 @@
 //   - 批量发送：满足条数/字节数/时间任一条件即发送
 //   - 自动重试：失败自动重试最多 3 次，递增退避
 //   - 鉴权：自动携带 X-Auth-Token 请求头
-//   - 空字段校验：Collection/Ops/PSid 为空时丢弃
+//   - Schema 校验：Collection 为空丢弃，业务字段按注册的 Schema 校验
 //   - 并发安全：Send 可在多个 goroutine 中调用
 //
 // 用法：
@@ -20,13 +20,15 @@
 //
 //	client.Send(producer.Record{
 //	    Collection: "logs",
-//	    Ops:        "bet",
-//	    PSid:       "session_123",
-//	    Tba:        100.0,
-//	    Tid:        "txn_001",
-//	    Twla:       95.0,
-//	    Gd:         `{"gid":126,"cc":"VND"}`,
 //	    CreatedAt:  time.Now().UnixMilli(),
+//	    Fields: map[string]interface{}{
+//	        "ops":  "bet",
+//	        "psid": "session_123",
+//	        "tba":  100.0,
+//	        "tid":  "txn_001",
+//	        "twla": 95.0,
+//	        "gd":   `{"gid":126,"cc":"VND"}`,
+//	    },
 //	})
 package producer
 
@@ -118,15 +120,22 @@ func New(cfg Config) *Client {
 // Send 非阻塞写入一条记录到本地缓冲队列。
 //
 // 校验规则：
-//   - Collection、Ops、PSid 为空时丢弃并打印错误日志，返回 false
+//   - Collection 为空时丢弃并返回 false
+//   - 如 Schema 注册了自定义 Validate，额外执行
 //   - 队列满时丢弃并返回 false
 //
 // 并发安全，可在多个 goroutine 中同时调用。
 func (c *Client) Send(record Record) bool {
-	if record.Collection == "" || record.Ops == "" || record.PSid == "" {
-		log.Printf("[producer] invalid record dropped: collection=%q ops=%q psid=%q",
-			record.Collection, record.Ops, record.PSid)
+	if record.Collection == "" {
+		log.Printf("[producer] invalid record dropped: collection empty")
 		return false
+	}
+	schema := model.DefaultRegistry.Get(record.Collection)
+	if schema != nil && schema.Validate != nil {
+		if err := schema.Validate(&record); err != nil {
+			log.Printf("[producer] invalid record dropped: %v", err)
+			return false
+		}
 	}
 	select {
 	case c.queue <- record:
@@ -152,7 +161,7 @@ func (c *Client) Close() {
 //
 // 发送触发条件（任一满足即立即发送）：
 //  1. 达到 BatchSize 条
-//  2. 超过 MaxBatchBytes 字节（基于 Gd 字段长度估算）
+//  2. 超过 MaxBatchBytes 字节（基于 Fields 中字符串值长度估算）
 //  3. 超过 FlushInterval 时间
 func (c *Client) flusher(ctx context.Context) {
 	defer c.wg.Done()
@@ -196,7 +205,13 @@ func (c *Client) flusher(ctx context.Context) {
 				return
 			}
 			batch = append(batch, record)
-			byteSize += len(record.Gd) + 200 // Gd 字符串长度 + 其他字段估算开销
+			fs := 0
+				for _, v := range record.Fields {
+					if s, ok := v.(string); ok {
+						fs += len(s)
+					}
+				}
+				byteSize += fs + 200
 			if len(batch) >= c.cfg.BatchSize || byteSize >= c.cfg.MaxBatchBytes {
 				flush()
 			}

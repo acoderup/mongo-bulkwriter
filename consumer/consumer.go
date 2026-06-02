@@ -2,7 +2,7 @@
 //
 // 内部架构：
 //
-//	HTTP ingest → 鉴权 → 空字段校验 → 非阻塞入队 → 内部队列 → worker pool → batch → Mongo BulkWrite
+//	HTTP ingest → 鉴权 → Schema 校验 → 非阻塞入队 → 内部队列 → worker pool → batch → Mongo BulkWrite
 //
 // 特性：
 //   - 非阻塞接收：HTTP 请求立即返回 202，不等待 Mongo 写入
@@ -10,11 +10,12 @@
 //   - 并发控制：信号量限制同时进行的 BulkWrite 数量
 //   - 背压保护：队列满时丢弃记录并返回 429
 //   - 鉴权：X-Auth-Token 恒定时间比较，防时序攻击
-//   - 自动索引：首次写入集合时自动创建查询索引
+//   - Schema 索引：按注册的 Schema 自动创建集合索引
 //
 // 用法：
 //
-//	h := consumer.NewHandler(db, consumer.Config{AuthToken: "secret"})
+//	bulkwriter.RegisterSchema("logs", "ops", "psid", "-created_at")
+//	h := consumer.NewHandler(client, db, uri, dbName, consumer.Config{AuthToken: "secret"})
 //	r.POST("/bulkwriter/ingest", gin.WrapH(h))
 //	defer h.Shutdown()
 package consumer
@@ -171,7 +172,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 //  2. 鉴权校验（X-Auth-Token，恒定时间比较）
 //  3. 限制请求体大小（MaxBodySize）
 //  4. JSON 解码
-//  5. 逐条入队（Collection/Ops/PSid 为空则丢弃）
+//  5. 逐条入队（Collection 为空则丢弃，Schema.Validate 可选）
 //  6. 返回 202（部分成功）或 429（全部丢弃）
 //
 //	POST /bulkwriter/ingest
@@ -208,9 +209,16 @@ func (h *Handler) Ingest(w http.ResponseWriter, r *http.Request) {
 	// 非阻塞入队：局部累积后一次性更新指标，避免逐条加锁
 	var queued, dropped int
 	for _, record := range req.Records {
-		if record.Collection == "" || record.Ops == "" || record.PSid == "" {
+		if record.Collection == "" {
 			dropped++
 			continue
+		}
+		schema := model.DefaultRegistry.Get(record.Collection)
+		if schema != nil && schema.Validate != nil {
+			if err := schema.Validate(&record); err != nil {
+				dropped++
+				continue
+			}
 		}
 		select {
 		case h.queue <- record:
@@ -340,7 +348,14 @@ func (h *Handler) worker(ctx context.Context, id int) {
 				return
 			}
 			batch = append(batch, record)
-			batchBytes += len(record.Gd) + 200 // Gd 字符串长度 + 其他字段估算
+			// 估算 Fields 序列化大小
+				fs := 0
+				for _, v := range record.Fields {
+					if s, ok := v.(string); ok {
+						fs += len(s)
+					}
+				}
+				batchBytes += fs + 200
 			if len(batch) >= h.cfg.BatchSize || batchBytes >= h.cfg.BatchBytes {
 				flush()
 			}

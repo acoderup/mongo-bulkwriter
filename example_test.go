@@ -1,5 +1,5 @@
 // mongo-bulkwriter 完整使用示例。
-// 展示生产者（其他服务）、消费者（本项目）、查询三端的完整用法，包含鉴权。
+// 展示生产者、消费者、直写、查询四端的完整用法。
 
 package bulkwriter_test
 
@@ -11,7 +11,6 @@ import (
 
 	"github.com/acoderup/mongo-bulkwriter"
 	"github.com/acoderup/mongo-bulkwriter/consumer"
-	"github.com/acoderup/mongo-bulkwriter/model"
 	"github.com/acoderup/mongo-bulkwriter/producer"
 )
 
@@ -28,7 +27,10 @@ func Example_consumer() {
 	)
 	defer client.Disconnect(context.Background())
 
-	handler := consumer.NewHandler(db, consumer.Config{
+	// 注册 Schema：一行指定索引字段
+	bulkwriter.RegisterSchema("bets", "ops", "psid", "producer_id", "tid", "-created_at")
+
+	handler := consumer.NewHandler(client, db, "mongodb://127.0.0.1:27017", "qstar-history", consumer.Config{
 		AuthToken:     authToken,
 		Workers:       32,
 		BatchSize:     500,
@@ -60,24 +62,28 @@ func Example_producer() {
 	})
 	defer client.Close()
 
-	// 有效记录：包含完整的投注信息
+	// 有效记录：完整投注信息（新格式，通过 Fields 传入业务字段）
 	client.Send(producer.Record{
 		Collection: "bets",
-		Ops:        "bet",
-		PSid:       "session_123",
-		ProducerID: 1,
-		Tba:        100.0,
-		Tid:        "txn_001",
-		Twla:       95.0,
-		Gd:         `{"gid":126,"cc":"VND","gtba":100,"gtwla":95}`,
 		CreatedAt:  time.Now().UnixMilli(),
+		Fields: map[string]interface{}{
+			"ops":         "bet",
+			"psid":        "session_123",
+			"producer_id": 1,
+			"tba":         100.0,
+			"tid":         "txn_001",
+			"twla":        95.0,
+			"gd":          `{"gid":126,"cc":"VND","gtba":100,"gtwla":95}`,
+		},
 	})
 
 	// 无效记录：Collection 为空 → 丢弃 + 日志
 	client.Send(producer.Record{
-		Ops:  "bet",
-		PSid: "session_123",
-		Gd:   "missing collection",
+		Fields: map[string]interface{}{
+			"ops":  "bet",
+			"psid": "session_123",
+			"gd":   "missing collection",
+		},
 	})
 
 	log.Println("生产者已发送数据")
@@ -93,23 +99,23 @@ func Example_directWrite() {
 		"qstar-history",
 	)
 
-	bulkwriter.BulkInsert(context.Background(), db, []model.Record{
-		{
-			Collection: "api_logs",
-			Ops:        "verify",
-			PSid:       "session_1",
-			Tid:        "txn_101",
-			Gd:         `{"gid":126}`,
-			CreatedAt:  time.Now().UnixMilli(),
-		},
-		{
-			Collection: "api_logs",
-			Ops:        "report",
-			PSid:       "session_1",
-			Tid:        "txn_102",
-			Gd:         `{"gid":126}`,
-			CreatedAt:  time.Now().UnixMilli(),
-		},
+	// 注册 Schema
+	bulkwriter.RegisterSchema("api_logs", "ops", "psid", "tid", "-created_at")
+
+	// 用 NewRecord 快速创建记录
+	bulkwriter.BulkInsert(context.Background(), db, []bulkwriter.Record{
+		bulkwriter.NewRecord("api_logs", map[string]interface{}{
+			"ops":  "verify",
+			"psid": "session_1",
+			"tid":  "txn_101",
+			"gd":   `{"gid":126}`,
+		}),
+		bulkwriter.NewRecord("api_logs", map[string]interface{}{
+			"ops":  "report",
+			"psid": "session_1",
+			"tid":  "txn_102",
+			"gd":   `{"gid":126}`,
+		}),
 	})
 }
 
