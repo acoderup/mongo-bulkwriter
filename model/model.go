@@ -8,7 +8,9 @@
 package model
 
 import (
+	"bytes"
 	"encoding/json"
+	"strings"
 	"sync"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -43,7 +45,7 @@ var infraKeys = map[string]bool{
 //
 // 新格式优先走 struct 快速路径（单次解码），旧格式（扁平字段）回退到 map 解析。
 func (r *Record) UnmarshalJSON(data []byte) error {
-	// 快速路径：新格式 struct 解码
+	// 快速路径：使用 UseNumber 保留整数精度，避免大整数变 float64 丢失精度
 	type fast struct {
 		Collection string                 `json:"collection"`
 		ProducerID int                    `json:"producer_id"`
@@ -51,17 +53,23 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 		Fields     map[string]interface{} `json:"fields"`
 	}
 	var f fast
-	if err := json.Unmarshal(data, &f); err != nil {
-		return err
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&f); err != nil {
+		// UseNumber 对 int 字段解码可能失败，回退标准解码
+		if err2 := json.Unmarshal(data, &f); err2 != nil {
+			return err2
+		}
 	}
 	if f.Fields != nil {
 		r.Collection = f.Collection
 		r.ProducerID = f.ProducerID
 		r.CreatedAt = f.CreatedAt
-		// 剔除基础设施字段，避免 BSON inline 时与 DocRecord 固定字段冲突
+		// 剔除基础设施字段
 		delete(f.Fields, "producer_id")
 		delete(f.Fields, "created_at")
-		r.Fields = f.Fields
+		// 将 json.Number 转为实际数字类型（int64 或 float64）
+		r.Fields = convertNumbers(f.Fields).(map[string]interface{})
 		return nil
 	}
 
@@ -97,6 +105,7 @@ func (r *Record) UnmarshalJSON(data []byte) error {
 			r.Fields[k] = v
 		}
 	}
+	r.Fields = convertNumbers(r.Fields).(map[string]interface{})
 	return nil
 }
 
@@ -108,6 +117,35 @@ type DocRecord struct {
 	ProducerID int                    `bson:"producer_id"`
 	CreatedAt  int64                  `bson:"created_at"`
 	Fields     map[string]interface{} `bson:",inline"`
+}
+
+// convertNumbers 递归将 json.Number 转为 int64 或 float64，保留大整数精度。
+func convertNumbers(v interface{}) interface{} {
+	switch val := v.(type) {
+	case json.Number:
+		// 尝试 int64（无小数点），失败则 float64
+		if i, err := val.Int64(); err == nil {
+			// 检查原始字符串是否包含小数点
+			if !strings.Contains(val.String(), ".") {
+				return i
+			}
+		}
+		if f, err := val.Float64(); err == nil {
+			return f
+		}
+		return v
+	case map[string]interface{}:
+		for k, vv := range val {
+			val[k] = convertNumbers(vv)
+		}
+		return val
+	case []interface{}:
+		for i, vv := range val {
+			val[i] = convertNumbers(vv)
+		}
+		return val
+	}
+	return v
 }
 
 // ToDocRecord 将 Record 转为 MongoDB 文档结构。
