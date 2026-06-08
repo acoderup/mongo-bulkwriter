@@ -10,6 +10,7 @@ package model
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 
@@ -198,13 +199,19 @@ func (d IndexDefinition) ToMongoIndex() mongo.IndexModel {
 	return idx
 }
 
+// SchemaProvider 为未注册的 collection 按需生成 Schema。
+// 返回 nil 表示回退到默认 Schema。首次调用后自动注册，后续命中缓存。
+type SchemaProvider func(collection string) *Schema
+
 // SchemaRegistry 管理 collection → Schema 的映射，并发安全。
 //
 // 未注册的 collection 自动使用默认 Schema。
+// 可通过 SetProvider 设置懒加载回调，按需为动态集合生成 Schema。
 type SchemaRegistry struct {
 	mu       sync.RWMutex
 	schemas  map[string]*Schema
 	defaults *Schema
+	provider SchemaProvider
 }
 
 // NewSchemaRegistry 创建注册表，默认 Schema 为 DefaultSchema()。
@@ -229,13 +236,44 @@ func (r *SchemaRegistry) SetDefault(s *Schema) {
 	r.defaults = s
 }
 
+// SetProvider 设置懒加载回调。支持多次调用：后注册的 provider 优先，
+// 返回 nil 时自动回退到前一个 provider，形成责任链。
+func (r *SchemaRegistry) SetProvider(p SchemaProvider) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	prev := r.provider
+	if prev == nil {
+		r.provider = p
+		return
+	}
+	r.provider = func(collection string) *Schema {
+		if s := p(collection); s != nil {
+			return s
+		}
+		return prev(collection)
+	}
+}
+
 // Get 获取指定 collection 的 Schema，未注册则返回默认 Schema。
 func (r *SchemaRegistry) Get(collection string) *Schema {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	if s, ok := r.schemas[collection]; ok {
+		r.mu.RUnlock()
 		return s
 	}
+	// 快照 provider 避免持锁调用
+	p := r.provider
+	r.mu.RUnlock()
+
+	if p != nil {
+		if s := p(collection); s != nil {
+			r.Register(collection, s)
+			return s
+		}
+	}
+
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.defaults
 }
 
@@ -336,4 +374,58 @@ func (r *SchemaRegistry) RegisterSchema(collection, name string, indexes ...Inde
 	s := &Schema{Name: name, Indexes: indexes}
 	r.Register(collection, s)
 	return s
+}
+
+// ──────────────────────────────────────────────
+// 共享校验工具 — PG/PP 服务按需组合使用
+// ──────────────────────────────────────────────
+
+// RequireStringField 校验 record.Fields 中指定字段为非空字符串。
+func RequireStringField(field string) func(*Record) error {
+	return func(r *Record) error {
+		if r.Fields == nil {
+			return fmt.Errorf("%s is required", field)
+		}
+		s, ok := r.Fields[field].(string)
+		if !ok || s == "" {
+			return fmt.Errorf("%s is required and must be a non-empty string", field)
+		}
+		return nil
+	}
+}
+
+// RequireNumericField 校验 record.Fields 中指定字段存在且为数字类型。
+func RequireNumericField(field string) func(*Record) error {
+	return func(r *Record) error {
+		if r.Fields == nil {
+			return fmt.Errorf("%s is required", field)
+		}
+		v, ok := r.Fields[field]
+		if !ok {
+			return fmt.Errorf("%s is required", field)
+		}
+		switch v.(type) {
+		case float64, int, int64, int32, json.Number:
+			return nil
+		}
+		return fmt.Errorf("%s must be a number", field)
+	}
+}
+
+// RequireFields 返回一个校验函数，组合多个字段校验器（短路：首个失败即返回）。
+// 典型用法:
+//
+//	WithValidate(model.RequireFields(
+//	    model.RequireStringField("ops"),
+//	    model.RequireNumericField("roundId"),
+//	))
+func RequireFields(validators ...func(*Record) error) func(*Record) error {
+	return func(r *Record) error {
+		for _, v := range validators {
+			if err := v(r); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
